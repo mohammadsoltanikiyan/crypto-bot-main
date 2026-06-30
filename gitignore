@@ -1,0 +1,7 @@
+.env
+*.json
+*.log
+*.bak
+venv/
+__pycache__/
+*.pyc

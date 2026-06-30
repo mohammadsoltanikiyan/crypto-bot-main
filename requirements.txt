@@ -1,0 +1,5 @@
+python-telegram-bot==21.4
+aiohttp==3.9.5
+numpy==1.26.4
+APScheduler==3.10.4
+python-dotenv==1.0.1
