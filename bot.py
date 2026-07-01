@@ -285,46 +285,226 @@ def init_user(chat_id):
         save_data()
 
 # =========================
-# BINANCE DATA
+# MULTI-SOURCE API (Binance → MEXC → Bybit → KuCoin)
 # =========================
-async def get_klines(symbol, interval="1h", limit=150):
+
+# تبدیل نام سمبل برای هر صرافی
+def _to_mexc(symbol):   return symbol                          # BTCUSDT
+def _to_bybit(symbol):  return symbol                          # BTCUSDT
+def _to_kucoin(symbol): return symbol[:-4] + "-" + symbol[-4:]  # BTC-USDT
+
+# نگاشت بازه زمانی Binance → هر صرافی
+_TF_MEXC   = {"1m":"1m","5m":"5m","15m":"15m","1h":"60m","4h":"4h","1d":"1d","1w":"1W"}
+_TF_BYBIT  = {"1m":"1","5m":"5","15m":"15","1h":"60","4h":"240","1d":"D","1w":"W"}
+_TF_KUCOIN = {"1m":"1min","5m":"5min","15m":"15min","1h":"1hour","4h":"4hour","1d":"1day","1w":"1week"}
+
+
+async def _klines_binance(symbol, interval, limit):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    try:
-        async with session.get(url, timeout=15) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-            if len(data) < 30:
-                return None
-            return {
-                "closes":  np.array([float(c[4]) for c in data]),
-                "highs":   np.array([float(c[2]) for c in data]),
-                "lows":    np.array([float(c[3]) for c in data]),
-                "opens":   np.array([float(c[1]) for c in data]),
-                "volumes": np.array([float(c[5]) for c in data]),
-            }
-    except Exception as e:
-        log.error(f"get_klines {symbol}/{interval}: {e}")
-        return None
+    async with session.get(url, timeout=15) as r:
+        if r.status != 200:
+            return None
+        data = await r.json()
+        if len(data) < 30:
+            return None
+        return {
+            "closes":  np.array([float(c[4]) for c in data]),
+            "highs":   np.array([float(c[2]) for c in data]),
+            "lows":    np.array([float(c[3]) for c in data]),
+            "opens":   np.array([float(c[1]) for c in data]),
+            "volumes": np.array([float(c[5]) for c in data]),
+        }
+
+
+async def _klines_mexc(symbol, interval, limit):
+    tf  = _TF_MEXC.get(interval, interval)
+    url = f"https://api.mexc.com/api/v3/klines?symbol={_to_mexc(symbol)}&interval={tf}&limit={limit}"
+    async with session.get(url, timeout=15) as r:
+        if r.status != 200:
+            return None
+        data = await r.json()
+        if len(data) < 30:
+            return None
+        return {
+            "closes":  np.array([float(c[4]) for c in data]),
+            "highs":   np.array([float(c[2]) for c in data]),
+            "lows":    np.array([float(c[3]) for c in data]),
+            "opens":   np.array([float(c[1]) for c in data]),
+            "volumes": np.array([float(c[5]) for c in data]),
+        }
+
+
+async def _klines_bybit(symbol, interval, limit):
+    tf  = _TF_BYBIT.get(interval, "60")
+    url = (
+        f"https://api.bybit.com/v5/market/kline"
+        f"?category=spot&symbol={_to_bybit(symbol)}&interval={tf}&limit={limit}"
+    )
+    async with session.get(url, timeout=15) as r:
+        if r.status != 200:
+            return None
+        d = await r.json()
+        if d.get("retCode") != 0:
+            return None
+        rows = d["result"]["list"]          # نزولی مرتب شده — باید معکوس بشه
+        if len(rows) < 30:
+            return None
+        rows = list(reversed(rows))
+        return {
+            "opens":   np.array([float(c[1]) for c in rows]),
+            "highs":   np.array([float(c[2]) for c in rows]),
+            "lows":    np.array([float(c[3]) for c in rows]),
+            "closes":  np.array([float(c[4]) for c in rows]),
+            "volumes": np.array([float(c[5]) for c in rows]),
+        }
+
+
+async def _klines_kucoin(symbol, interval, limit):
+    import time
+    tf      = _TF_KUCOIN.get(interval, "1hour")
+    end_ts  = int(time.time())
+    # KuCoin محدودیت 1500 کندل داره؛ startAt رو تنظیم می‌کنیم
+    secs_map = {"1min":60,"5min":300,"15min":900,"1hour":3600,"4hour":14400,"1day":86400,"1week":604800}
+    step    = secs_map.get(tf, 3600)
+    start_ts = end_ts - step * limit
+    url = (
+        f"https://api.kucoin.com/api/v1/market/candles"
+        f"?type={tf}&symbol={_to_kucoin(symbol)}&startAt={start_ts}&endAt={end_ts}"
+    )
+    async with session.get(url, timeout=15) as r:
+        if r.status != 200:
+            return None
+        d = await r.json()
+        if d.get("code") != "200000":
+            return None
+        rows = list(reversed(d["data"]))    # KuCoin هم نزولی میده
+        if len(rows) < 30:
+            return None
+        return {
+            "opens":   np.array([float(c[1]) for c in rows]),
+            "closes":  np.array([float(c[2]) for c in rows]),
+            "highs":   np.array([float(c[3]) for c in rows]),
+            "lows":    np.array([float(c[4]) for c in rows]),
+            "volumes": np.array([float(c[5]) for c in rows]),
+        }
+
+
+async def get_klines(symbol, interval="1h", limit=150):
+    sources = [
+        ("Binance",  _klines_binance),
+        ("MEXC",     _klines_mexc),
+        ("Bybit",    _klines_bybit),
+        ("KuCoin",   _klines_kucoin),
+    ]
+    for name, fn in sources:
+        try:
+            result = await fn(symbol, interval, limit)
+            if result is not None:
+                if name != "Binance":
+                    log.info(f"klines {symbol}/{interval} از {name} دریافت شد")
+                return result
+        except Exception as e:
+            log.warning(f"get_klines [{name}] {symbol}/{interval}: {e}")
+    log.error(f"get_klines {symbol}/{interval}: همه منابع ناموفق بودند")
+    return None
+
+
+async def _ticker_binance(symbol):
+    url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
+    async with session.get(url, timeout=10) as r:
+        if r.status != 200:
+            return None
+        d = await r.json()
+        return {
+            "price":        float(d["lastPrice"]),
+            "change":       float(d["priceChangePercent"]),
+            "high":         float(d["highPrice"]),
+            "low":          float(d["lowPrice"]),
+            "volume":       float(d["volume"]),
+            "quote_volume": float(d["quoteVolume"]),
+        }
+
+
+async def _ticker_mexc(symbol):
+    url = f"https://api.mexc.com/api/v3/ticker/24hr?symbol={_to_mexc(symbol)}"
+    async with session.get(url, timeout=10) as r:
+        if r.status != 200:
+            return None
+        d = await r.json()
+        return {
+            "price":        float(d["lastPrice"]),
+            "change":       float(d["priceChangePercent"]),
+            "high":         float(d["highPrice"]),
+            "low":          float(d["lowPrice"]),
+            "volume":       float(d["volume"]),
+            "quote_volume": float(d["quoteVolume"]),
+        }
+
+
+async def _ticker_bybit(symbol):
+    url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={_to_bybit(symbol)}"
+    async with session.get(url, timeout=10) as r:
+        if r.status != 200:
+            return None
+        d = await r.json()
+        if d.get("retCode") != 0 or not d["result"]["list"]:
+            return None
+        t = d["result"]["list"][0]
+        price = float(t["lastPrice"])
+        prev  = float(t.get("prevPrice24h") or price)
+        change = ((price - prev) / prev * 100) if prev else 0.0
+        return {
+            "price":        price,
+            "change":       round(change, 2),
+            "high":         float(t["highPrice24h"]),
+            "low":          float(t["lowPrice24h"]),
+            "volume":       float(t["volume24h"]),
+            "quote_volume": float(t["turnover24h"]),
+        }
+
+
+async def _ticker_kucoin(symbol):
+    url = f"https://api.kucoin.com/api/v1/market/stats?symbol={_to_kucoin(symbol)}"
+    async with session.get(url, timeout=10) as r:
+        if r.status != 200:
+            return None
+        d = await r.json()
+        if d.get("code") != "200000":
+            return None
+        t     = d["data"]
+        price = float(t["last"] or 0)
+        if not price:
+            return None
+        change = float(t.get("changeRate") or 0) * 100
+        return {
+            "price":        price,
+            "change":       round(change, 2),
+            "high":         float(t["high"] or price),
+            "low":          float(t["low"]  or price),
+            "volume":       float(t["vol"]  or 0),
+            "quote_volume": float(t["volValue"] or 0),
+        }
+
 
 async def get_ticker(symbol):
-    url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
-    try:
-        async with session.get(url, timeout=10) as resp:
-            if resp.status != 200:
-                return None
-            d = await resp.json()
-            return {
-                "price":        float(d["lastPrice"]),
-                "change":       float(d["priceChangePercent"]),
-                "high":         float(d["highPrice"]),
-                "low":          float(d["lowPrice"]),
-                "volume":       float(d["volume"]),
-                "quote_volume": float(d["quoteVolume"]),
-            }
-    except Exception as e:
-        log.error(f"get_ticker {symbol}: {e}")
-        return None
+    sources = [
+        ("Binance", _ticker_binance),
+        ("MEXC",    _ticker_mexc),
+        ("Bybit",   _ticker_bybit),
+        ("KuCoin",  _ticker_kucoin),
+    ]
+    for name, fn in sources:
+        try:
+            result = await fn(symbol)
+            if result is not None:
+                if name != "Binance":
+                    log.info(f"ticker {symbol} از {name} دریافت شد")
+                return result
+        except Exception as e:
+            log.warning(f"get_ticker [{name}] {symbol}: {e}")
+    log.error(f"get_ticker {symbol}: همه منابع ناموفق بودند")
+    return None
+
 
 async def validate_symbol(symbol):
     symbol = symbol.upper()
