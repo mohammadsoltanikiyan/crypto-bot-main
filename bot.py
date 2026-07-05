@@ -27,13 +27,11 @@ log = logging.getLogger(__name__)
 # =========================
 TOKEN      = os.environ.get("BOT_TOKEN")
 if not TOKEN:
-    raise SystemExit(
-        "❌ BOT_TOKEN تنظیم نشده. فایل .env بساز و BOT_TOKEN=<توکن بات‌فادر> رو توش بذار."
-    )
+    raise SystemExit("❌ BOT_TOKEN تنظیم نشده.")
 
 DATA_FILE  = os.environ.get("DATA_FILE", "users_data.json")
-USERS_FILE = os.environ.get("USERS_FILE", "users_list.json")   # فایل ثبت کاربران
-ADMIN_ID   = os.environ.get("ADMIN_ID", "")  # chat_id ادمین
+USERS_FILE = os.environ.get("USERS_FILE", "users_list.json")
+ADMIN_ID   = os.environ.get("ADMIN_ID", "")
 
 scheduler = AsyncIOScheduler()
 session = None
@@ -51,262 +49,100 @@ AVAILABLE_SYMBOLS = [
     "WLDUSDT","SANDUSDT","MANAUSDT","AXSUSDT","IMXUSDT",
 ]
 
+# =========================
+# TRADING MODES — هر مود منطق جداگانه دارد
+# =========================
 TRADING_MODES = {
     "scalp": {
         "label": "⚡ اسکالپ (۵-۱۵ دقیقه)",
-        "timeframes": ["1m","5m","15m"],
-        "weights":    {"1m":1,"5m":2,"15m":3},
+        "timeframes": ["1m", "5m", "15m"],
+        "weights":    {"1m": 1, "5m": 2, "15m": 3},
         "kline_limit": 150,
-        "signal_threshold": 6,
-        "min_agreement": 0.70,
+        "signal_threshold": 5,
+        "min_agreement": 0.65,
         "hold_label": "۱۵-۳۰ دقیقه",
         "hold_hours": 0.5,
         "interval_minutes": 15,
-        "risk_pct": 1.0,
+        "risk_pct": 0.5,
+        # منطق اختصاصی اسکالپ
+        "primary_indicators": ["stoch", "vwap", "bb", "volume", "candle_pattern"],
+        "secondary_indicators": ["rsi", "macd"],
+        "sl_atr_mult": 1.0,
+        "tp_atr_mults": [1.5, 2.5],
+        "require_volume_confirm": True,
+        "use_market_structure": False,
     },
     "short": {
         "label": "🕐 کوتاه‌مدت (۱-۴ ساعت)",
-        "timeframes": ["15m","1h","4h"],
-        "weights":    {"15m":1,"1h":3,"4h":2},
+        "timeframes": ["15m", "1h", "4h"],
+        "weights":    {"15m": 1, "1h": 3, "4h": 2},
         "kline_limit": 150,
-        "signal_threshold": 8,
+        "signal_threshold": 7,
         "min_agreement": 0.70,
         "hold_label": "۴-۱۲ ساعت",
         "hold_hours": 6,
         "interval_minutes": 60,
-        "risk_pct": 1.5,
+        "risk_pct": 1.0,
+        "primary_indicators": ["rsi", "macd", "bb", "adx", "stoch"],
+        "secondary_indicators": ["ichimoku", "vwap", "divergence"],
+        "sl_atr_mult": 1.5,
+        "tp_atr_mults": [2.0, 4.0],
+        "require_volume_confirm": False,
+        "use_market_structure": False,
     },
     "mid": {
         "label": "📅 میان‌مدت (روزانه)",
-        "timeframes": ["1h","4h","1d"],
-        "weights":    {"1h":1,"4h":2,"1d":3},
+        "timeframes": ["1h", "4h", "1d"],
+        "weights":    {"1h": 1, "4h": 2, "1d": 3},
         "kline_limit": 200,
-        "signal_threshold": 10,
+        "signal_threshold": 9,
         "min_agreement": 0.72,
         "hold_label": "۲-۷ روز",
         "hold_hours": 72,
         "interval_minutes": 240,
-        "risk_pct": 2.0,
+        "risk_pct": 1.5,
+        "primary_indicators": ["ichimoku", "ema_cross", "adx", "market_structure", "divergence"],
+        "secondary_indicators": ["rsi", "macd", "volume"],
+        "sl_atr_mult": 2.0,
+        "tp_atr_mults": [3.0, 6.0],
+        "require_volume_confirm": False,
+        "use_market_structure": True,
     },
     "long": {
         "label": "📈 بلندمدت (هفتگی)",
-        "timeframes": ["4h","1d","1w"],
-        "weights":    {"4h":1,"1d":3,"1w":4},
+        "timeframes": ["4h", "1d", "1w"],
+        "weights":    {"4h": 1, "1d": 3, "1w": 4},
         "kline_limit": 200,
-        "signal_threshold": 12,
+        "signal_threshold": 11,
         "min_agreement": 0.75,
         "hold_label": "۲-۸ هفته",
         "hold_hours": 336,
         "interval_minutes": 1440,
-        "risk_pct": 3.0,
+        "risk_pct": 2.0,
+        "primary_indicators": ["ema200", "market_structure", "ichimoku", "volume_profile"],
+        "secondary_indicators": ["rsi", "adx", "macd"],
+        "sl_atr_mult": 2.5,
+        "tp_atr_mults": [4.0, 8.0],
+        "require_volume_confirm": False,
+        "use_market_structure": True,
     },
 }
 
 # =========================
-# LEVERAGE ENGINE
+# MULTI-SOURCE API
 # =========================
-def calc_leverage(signal_score, agreement_pct, mode_key, confidence_label, atr_pct):
-    base_leverage = {
-        "scalp": 5,
-        "short": 3,
-        "mid":   2,
-        "long":  2,
-    }.get(mode_key, 2)
-
-    if agreement_pct >= 85:
-        agree_factor = 1.4
-    elif agreement_pct >= 78:
-        agree_factor = 1.2
-    elif agreement_pct >= 70:
-        agree_factor = 1.0
-    else:
-        agree_factor = 0.6
-
-    conf_factor = {
-        "خیلی بالا 🔥🔥": 1.3,
-        "بالا 🔥":         1.1,
-        "متوسط ✅":        0.9,
-    }.get(confidence_label, 1.0)
-
-    if atr_pct >= 3.0:
-        vol_factor = 0.5
-    elif atr_pct >= 2.0:
-        vol_factor = 0.7
-    elif atr_pct >= 1.0:
-        vol_factor = 0.9
-    else:
-        vol_factor = 1.1
-
-    raw = base_leverage * agree_factor * conf_factor * vol_factor
-    leverage = max(1, min(10, round(raw)))
-    return leverage
-
-def build_leverage_section(analysis, capital):
-    if analysis["direction"] == "NEUTRAL ⚪" or not analysis["stop_loss"]:
-        return ""
-
-    entry    = analysis["entry"]
-    sl       = analysis["stop_loss"]
-    tp1      = analysis["tp1"]
-    tp2      = analysis["tp2"]
-
-    sl_pct   = abs(entry - sl) / entry * 100
-    tp1_pct  = abs(tp1 - entry) / entry * 100 if tp1 else 0
-    tp2_pct  = abs(tp2 - entry) / entry * 100 if tp2 else 0
-
-    atr_pct = sl_pct / 1.5
-
-    leverage = calc_leverage(
-        signal_score    = analysis["score"],
-        agreement_pct   = analysis["agreement"],
-        mode_key        = analysis["mode"],
-        confidence_label= analysis["confidence"],
-        atr_pct         = atr_pct,
-    )
-
-    tp1_with_lev = round(tp1_pct * leverage, 2)
-    tp2_with_lev = round(tp2_pct * leverage, 2)
-    sl_with_lev  = round(sl_pct  * leverage, 2)
-
-    capital_line = ""
-    if capital:
-        position_usd = capital * 0.20
-        profit_tp1   = round(position_usd * (tp1_with_lev / 100), 2)
-        profit_tp2   = round(position_usd * (tp2_with_lev / 100), 2)
-        loss_sl      = round(position_usd * (sl_with_lev  / 100), 2)
-        capital_line = (
-            f"💵 با ۲۰٪ سرمایه (${position_usd:,.0f}):\n"
-            f"  سود TP1: +${profit_tp1:,.1f}  |  سود TP2: +${profit_tp2:,.1f}\n"
-            f"  زیان SL: -${loss_sl:,.1f}\n"
-        )
-
-    if leverage <= 2:
-        lev_emoji = "🟢"
-        lev_note  = "محافظه‌کارانه — مناسب برای مبتدی"
-    elif leverage <= 5:
-        lev_emoji = "🟡"
-        lev_note  = "متعادل — مناسب برای معامله‌گر با تجربه"
-    else:
-        lev_emoji = "🔴"
-        lev_note  = "ریسک بالا — فقط با استاپ‌لاس سخت"
-
-    msg  = f"\n⚡ اهرم پیشنهادی:\n"
-    msg += f"━━━━━━━━━━━━━━━\n"
-    msg += f"{lev_emoji} اهرم: {leverage}x  ({lev_note})\n\n"
-    msg += f"📊 سود/زیان با اهرم {leverage}x:\n"
-    msg += f"  بدون اهرم → TP1: +{tp1_pct:.2f}%  |  SL: -{sl_pct:.2f}%\n"
-    msg += f"  با اهرم   → TP1: +{tp1_with_lev}%  |  SL: -{sl_with_lev}%\n"
-    if tp2:
-        msg += f"  با اهرم   → TP2: +{tp2_with_lev}%\n"
-    if capital_line:
-        msg += f"\n{capital_line}"
-    msg += f"\n⚠️ هشدار: اهرم سود و زیان رو هر دو چند برابر می‌کنه\n"
-    msg += f"📌 همیشه استاپ‌لاس بذار — لیکویید نشی!\n"
-    return msg
-
-# =========================
-# DATA
-# =========================
-def load_data():
-    global user_data
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE,"r",encoding="utf-8") as f:
-                user_data = json.load(f)
-        except Exception as e:
-            log.error(f"Load data error: {e}")
-            user_data = {}
-
-def save_data():
-    try:
-        tmp = DATA_FILE + ".tmp"
-        with open(tmp,"w",encoding="utf-8") as f:
-            json.dump(user_data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, DATA_FILE)
-    except Exception as e:
-        log.error(f"Save error: {e}")
-
-def backup_data():
-    try:
-        with open(DATA_FILE+".bak","w",encoding="utf-8") as f:
-            json.dump(user_data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.error(f"Backup error: {e}")
-
-# =========================
-# USER REGISTRY
-# =========================
-def load_users_list():
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
-
-def save_users_list(ul):
-    try:
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(ul, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.error(f"Save users_list error: {e}")
-
-def register_user(update: Update):
-    user    = update.effective_user
-    chat_id = str(update.effective_chat.id)
-    ul      = load_users_list()
-    is_new  = chat_id not in ul
-    ul[chat_id] = {
-        "chat_id":    chat_id,
-        "first_name": user.first_name or "",
-        "last_name":  user.last_name  or "",
-        "username":   f"@{user.username}" if user.username else "ندارد",
-        "first_seen": ul.get(chat_id, {}).get("first_seen", datetime.now().isoformat()),
-        "last_seen":  datetime.now().isoformat(),
-        "count":      ul.get(chat_id, {}).get("count", 0) + 1,
-    }
-    save_users_list(ul)
-    return is_new, ul[chat_id]
-
-def init_user(chat_id):
-    if chat_id not in user_data:
-        user_data[chat_id] = {
-            "symbols": ["BTCUSDT","ETHUSDT","SOLUSDT"],
-            "interval": 60,
-            "active": True,
-            "trading_mode": "short",
-            "capital": None,
-            "active_positions": {},
-            "signal_history": [],
-            "signal_stats": {"total":0,"win":0,"loss":0,"neutral_exit":0},
-            "price_alerts": {},
-        }
-        save_data()
-
-# =========================
-# MULTI-SOURCE API (Binance → MEXC → Bybit → KuCoin)
-# =========================
-
-# تبدیل نام سمبل برای هر صرافی
-def _to_mexc(symbol):   return symbol                          # BTCUSDT
-def _to_bybit(symbol):  return symbol                          # BTCUSDT
-def _to_kucoin(symbol): return symbol[:-4] + "-" + symbol[-4:]  # BTC-USDT
-
-# نگاشت بازه زمانی Binance → هر صرافی
 _TF_MEXC   = {"1m":"1m","5m":"5m","15m":"15m","1h":"60m","4h":"4h","1d":"1d","1w":"1W"}
 _TF_BYBIT  = {"1m":"1","5m":"5","15m":"15","1h":"60","4h":"240","1d":"D","1w":"W"}
 _TF_KUCOIN = {"1m":"1min","5m":"5min","15m":"15min","1h":"1hour","4h":"4hour","1d":"1day","1w":"1week"}
 
+def _to_kucoin(symbol): return symbol[:-4] + "-" + symbol[-4:]
 
 async def _klines_binance(symbol, interval, limit):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    async with session.get(url, timeout=15) as r:
-        if r.status != 200:
-            return None
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        if r.status != 200: return None
         data = await r.json()
-        if len(data) < 30:
-            return None
+        if len(data) < 30: return None
         return {
             "closes":  np.array([float(c[4]) for c in data]),
             "highs":   np.array([float(c[2]) for c in data]),
@@ -314,17 +150,14 @@ async def _klines_binance(symbol, interval, limit):
             "opens":   np.array([float(c[1]) for c in data]),
             "volumes": np.array([float(c[5]) for c in data]),
         }
-
 
 async def _klines_mexc(symbol, interval, limit):
     tf  = _TF_MEXC.get(interval, interval)
-    url = f"https://api.mexc.com/api/v3/klines?symbol={_to_mexc(symbol)}&interval={tf}&limit={limit}"
-    async with session.get(url, timeout=15) as r:
-        if r.status != 200:
-            return None
+    url = f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval={tf}&limit={limit}"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        if r.status != 200: return None
         data = await r.json()
-        if len(data) < 30:
-            return None
+        if len(data) < 30: return None
         return {
             "closes":  np.array([float(c[4]) for c in data]),
             "highs":   np.array([float(c[2]) for c in data]),
@@ -333,23 +166,16 @@ async def _klines_mexc(symbol, interval, limit):
             "volumes": np.array([float(c[5]) for c in data]),
         }
 
-
 async def _klines_bybit(symbol, interval, limit):
     tf  = _TF_BYBIT.get(interval, "60")
-    url = (
-        f"https://api.bybit.com/v5/market/kline"
-        f"?category=spot&symbol={_to_bybit(symbol)}&interval={tf}&limit={limit}"
-    )
-    async with session.get(url, timeout=15) as r:
-        if r.status != 200:
-            return None
+    url = (f"https://api.bybit.com/v5/market/kline"
+           f"?category=spot&symbol={symbol}&interval={tf}&limit={limit}")
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        if r.status != 200: return None
         d = await r.json()
-        if d.get("retCode") != 0:
-            return None
-        rows = d["result"]["list"]          # نزولی مرتب شده — باید معکوس بشه
-        if len(rows) < 30:
-            return None
-        rows = list(reversed(rows))
+        if d.get("retCode") != 0: return None
+        rows = list(reversed(d["result"]["list"]))
+        if len(rows) < 30: return None
         return {
             "opens":   np.array([float(c[1]) for c in rows]),
             "highs":   np.array([float(c[2]) for c in rows]),
@@ -358,28 +184,21 @@ async def _klines_bybit(symbol, interval, limit):
             "volumes": np.array([float(c[5]) for c in rows]),
         }
 
-
 async def _klines_kucoin(symbol, interval, limit):
     import time
     tf      = _TF_KUCOIN.get(interval, "1hour")
     end_ts  = int(time.time())
-    # KuCoin محدودیت 1500 کندل داره؛ startAt رو تنظیم می‌کنیم
     secs_map = {"1min":60,"5min":300,"15min":900,"1hour":3600,"4hour":14400,"1day":86400,"1week":604800}
     step    = secs_map.get(tf, 3600)
     start_ts = end_ts - step * limit
-    url = (
-        f"https://api.kucoin.com/api/v1/market/candles"
-        f"?type={tf}&symbol={_to_kucoin(symbol)}&startAt={start_ts}&endAt={end_ts}"
-    )
-    async with session.get(url, timeout=15) as r:
-        if r.status != 200:
-            return None
+    url = (f"https://api.kucoin.com/api/v1/market/candles"
+           f"?type={tf}&symbol={_to_kucoin(symbol)}&startAt={start_ts}&endAt={end_ts}")
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        if r.status != 200: return None
         d = await r.json()
-        if d.get("code") != "200000":
-            return None
-        rows = list(reversed(d["data"]))    # KuCoin هم نزولی میده
-        if len(rows) < 30:
-            return None
+        if d.get("code") != "200000": return None
+        rows = list(reversed(d["data"]))
+        if len(rows) < 30: return None
         return {
             "opens":   np.array([float(c[1]) for c in rows]),
             "closes":  np.array([float(c[2]) for c in rows]),
@@ -388,430 +207,924 @@ async def _klines_kucoin(symbol, interval, limit):
             "volumes": np.array([float(c[5]) for c in rows]),
         }
 
-
 async def get_klines(symbol, interval="1h", limit=150):
     sources = [
-        ("Binance",  _klines_binance),
-        ("MEXC",     _klines_mexc),
-        ("Bybit",    _klines_bybit),
-        ("KuCoin",   _klines_kucoin),
+        ("Binance", _klines_binance),
+        ("MEXC",    _klines_mexc),
+        ("Bybit",   _klines_bybit),
+        ("KuCoin",  _klines_kucoin),
     ]
     for name, fn in sources:
         try:
             result = await fn(symbol, interval, limit)
             if result is not None:
                 if name != "Binance":
-                    log.info(f"klines {symbol}/{interval} از {name} دریافت شد")
+                    log.info(f"klines {symbol}/{interval} از {name}")
                 return result
         except Exception as e:
             log.warning(f"get_klines [{name}] {symbol}/{interval}: {e}")
-    log.error(f"get_klines {symbol}/{interval}: همه منابع ناموفق بودند")
     return None
-
 
 async def _ticker_binance(symbol):
     url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
-    async with session.get(url, timeout=10) as r:
-        if r.status != 200:
-            return None
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        if r.status != 200: return None
         d = await r.json()
-        return {
-            "price":        float(d["lastPrice"]),
-            "change":       float(d["priceChangePercent"]),
-            "high":         float(d["highPrice"]),
-            "low":          float(d["lowPrice"]),
-            "volume":       float(d["volume"]),
-            "quote_volume": float(d["quoteVolume"]),
-        }
-
+        return {"price": float(d["lastPrice"]), "change": float(d["priceChangePercent"]),
+                "high": float(d["highPrice"]), "low": float(d["lowPrice"]),
+                "volume": float(d["volume"]), "quote_volume": float(d["quoteVolume"])}
 
 async def _ticker_mexc(symbol):
-    url = f"https://api.mexc.com/api/v3/ticker/24hr?symbol={_to_mexc(symbol)}"
-    async with session.get(url, timeout=10) as r:
-        if r.status != 200:
-            return None
+    url = f"https://api.mexc.com/api/v3/ticker/24hr?symbol={symbol}"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        if r.status != 200: return None
         d = await r.json()
-        return {
-            "price":        float(d["lastPrice"]),
-            "change":       float(d["priceChangePercent"]),
-            "high":         float(d["highPrice"]),
-            "low":          float(d["lowPrice"]),
-            "volume":       float(d["volume"]),
-            "quote_volume": float(d["quoteVolume"]),
-        }
-
+        return {"price": float(d["lastPrice"]), "change": float(d["priceChangePercent"]),
+                "high": float(d["highPrice"]), "low": float(d["lowPrice"]),
+                "volume": float(d["volume"]), "quote_volume": float(d["quoteVolume"])}
 
 async def _ticker_bybit(symbol):
-    url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={_to_bybit(symbol)}"
-    async with session.get(url, timeout=10) as r:
-        if r.status != 200:
-            return None
+    url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={symbol}"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        if r.status != 200: return None
         d = await r.json()
-        if d.get("retCode") != 0 or not d["result"]["list"]:
-            return None
+        if d.get("retCode") != 0 or not d["result"]["list"]: return None
         t = d["result"]["list"][0]
-        price = float(t["lastPrice"])
-        prev  = float(t.get("prevPrice24h") or price)
-        change = ((price - prev) / prev * 100) if prev else 0.0
-        return {
-            "price":        price,
-            "change":       round(change, 2),
-            "high":         float(t["highPrice24h"]),
-            "low":          float(t["lowPrice24h"]),
-            "volume":       float(t["volume24h"]),
-            "quote_volume": float(t["turnover24h"]),
-        }
-
+        price = float(t["lastPrice"]); prev = float(t.get("prevPrice24h") or price)
+        return {"price": price, "change": round((price-prev)/prev*100 if prev else 0, 2),
+                "high": float(t["highPrice24h"]), "low": float(t["lowPrice24h"]),
+                "volume": float(t["volume24h"]), "quote_volume": float(t["turnover24h"])}
 
 async def _ticker_kucoin(symbol):
     url = f"https://api.kucoin.com/api/v1/market/stats?symbol={_to_kucoin(symbol)}"
-    async with session.get(url, timeout=10) as r:
-        if r.status != 200:
-            return None
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        if r.status != 200: return None
         d = await r.json()
-        if d.get("code") != "200000":
-            return None
-        t     = d["data"]
-        price = float(t["last"] or 0)
-        if not price:
-            return None
-        change = float(t.get("changeRate") or 0) * 100
-        return {
-            "price":        price,
-            "change":       round(change, 2),
-            "high":         float(t["high"] or price),
-            "low":          float(t["low"]  or price),
-            "volume":       float(t["vol"]  or 0),
-            "quote_volume": float(t["volValue"] or 0),
-        }
-
+        if d.get("code") != "200000": return None
+        t = d["data"]; price = float(t["last"] or 0)
+        if not price: return None
+        return {"price": price, "change": round(float(t.get("changeRate") or 0)*100, 2),
+                "high": float(t["high"] or price), "low": float(t["low"] or price),
+                "volume": float(t["vol"] or 0), "quote_volume": float(t["volValue"] or 0)}
 
 async def get_ticker(symbol):
-    sources = [
-        ("Binance", _ticker_binance),
-        ("MEXC",    _ticker_mexc),
-        ("Bybit",   _ticker_bybit),
-        ("KuCoin",  _ticker_kucoin),
-    ]
-    for name, fn in sources:
+    for name, fn in [("Binance",_ticker_binance),("MEXC",_ticker_mexc),("Bybit",_ticker_bybit),("KuCoin",_ticker_kucoin)]:
         try:
-            result = await fn(symbol)
-            if result is not None:
-                if name != "Binance":
-                    log.info(f"ticker {symbol} از {name} دریافت شد")
-                return result
+            r = await fn(symbol)
+            if r:
+                if name != "Binance": log.info(f"ticker {symbol} از {name}")
+                return r
         except Exception as e:
             log.warning(f"get_ticker [{name}] {symbol}: {e}")
-    log.error(f"get_ticker {symbol}: همه منابع ناموفق بودند")
     return None
-
 
 async def validate_symbol(symbol):
     symbol = symbol.upper()
-    if not symbol.endswith("USDT"):
-        symbol += "USDT"
+    if not symbol.endswith("USDT"): symbol += "USDT"
     return symbol if await get_ticker(symbol) else None
+
+# =========================
+# EXTERNAL DATA
+# =========================
+async def get_fear_greed():
+    """Fear & Greed Index از alternative.me"""
+    try:
+        url = "https://api.alternative.me/fng/?limit=1"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status != 200: return None
+            d = await r.json()
+            val  = int(d["data"][0]["value"])
+            name = d["data"][0]["value_classification"]
+            emoji = "😱" if val < 25 else ("😨" if val < 45 else ("😐" if val < 55 else ("😊" if val < 75 else "🤑")))
+            return {"value": val, "label": name, "emoji": emoji}
+    except Exception as e:
+        log.warning(f"Fear&Greed: {e}")
+        return None
+
+async def get_funding_rate(symbol):
+    """Funding Rate از Binance فیوچرز"""
+    try:
+        sym = symbol.replace("USDT", "") + "USDT"
+        url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status != 200: return None
+            d = await r.json()
+            fr = float(d.get("lastFundingRate", 0)) * 100
+            return {"rate": round(fr, 4), "bullish": fr < 0, "extreme": abs(fr) > 0.1}
+    except Exception as e:
+        log.warning(f"FundingRate {symbol}: {e}")
+        return None
 
 # =========================
 # INDICATORS
 # =========================
 def calc_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50.0
+    if len(closes) < period + 1: return 50.0
     deltas = np.diff(closes)
     gains  = np.where(deltas > 0, deltas, 0.0)
     losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
+    avg_g  = np.mean(gains[:period]); avg_l = np.mean(losses[:period])
     for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0:
-        return 100.0
-    return round(100 - (100 / (1 + avg_gain / avg_loss)), 2)
+        avg_g = (avg_g*(period-1)+gains[i])/period
+        avg_l = (avg_l*(period-1)+losses[i])/period
+    return round(100 if avg_l == 0 else 100-(100/(1+avg_g/avg_l)), 2)
 
 def calc_rsi_series(closes, period=14):
-    if len(closes) < period + 2:
-        return [50.0]
-    return [calc_rsi(closes[:i], period) for i in range(period + 1, len(closes) + 1)]
+    if len(closes) < period+2: return [50.0]
+    return [calc_rsi(closes[:i], period) for i in range(period+1, len(closes)+1)]
 
 def calc_ema(closes, period):
-    if len(closes) < period:
-        return np.array([float(np.mean(closes))])
+    if len(closes) < period: return np.array([float(np.mean(closes))])
     ema = [float(np.mean(closes[:period]))]
-    k = 2 / (period + 1)
-    for p in closes[period:]:
-        ema.append(p * k + ema[-1] * (1 - k))
+    k = 2/(period+1)
+    for p in closes[period:]: ema.append(p*k+ema[-1]*(1-k))
     return np.array(ema)
 
 def calc_macd(closes):
-    if len(closes) < 35:
-        return None
-    ema12 = calc_ema(closes, 12)
-    ema26 = calc_ema(closes, 26)
+    if len(closes) < 35: return None
+    ema12 = calc_ema(closes, 12); ema26 = calc_ema(closes, 26)
     mn = min(len(ema12), len(ema26))
-    macd_line = ema12[-mn:] - ema26[-mn:]
-    if len(macd_line) < 9:
-        return None
-    signal_line = calc_ema(macd_line, 9)
-    hist = macd_line[-len(signal_line):] - signal_line
+    ml = ema12[-mn:] - ema26[-mn:]
+    if len(ml) < 9: return None
+    sl = calc_ema(ml, 9); hist = ml[-len(sl):] - sl
     cross = "none"
     if len(hist) >= 2:
         if hist[-2] < 0 and hist[-1] > 0: cross = "bullish_cross"
         elif hist[-2] > 0 and hist[-1] < 0: cross = "bearish_cross"
-    return {
-        "macd":      round(float(macd_line[-1]), 6),
-        "signal":    round(float(signal_line[-1]), 6),
-        "histogram": round(float(hist[-1]), 6),
-        "prev_hist": round(float(hist[-2]), 6) if len(hist) >= 2 else 0,
-        "cross":     cross,
-    }
+    return {"macd": round(float(ml[-1]),6), "signal": round(float(sl[-1]),6),
+            "histogram": round(float(hist[-1]),6), "prev_hist": round(float(hist[-2]),6) if len(hist)>=2 else 0,
+            "cross": cross}
 
 def calc_bollinger(closes, period=20):
-    if len(closes) < period:
-        return None
-    sma = np.mean(closes[-period:])
-    std = np.std(closes[-period:], ddof=1)
-    upper = sma + 2 * std
-    lower = sma - 2 * std
-    price = closes[-1]
-    bb_pct = (price - lower) / (upper - lower) * 100 if upper != lower else 50
-    return {
-        "upper":     round(float(upper), 6),
-        "mid":       round(float(sma), 6),
-        "lower":     round(float(lower), 6),
-        "bandwidth": round(float((upper - lower) / sma * 100), 2),
-        "bb_pct":    round(float(bb_pct), 2),
-    }
+    if len(closes) < period: return None
+    sma = np.mean(closes[-period:]); std = np.std(closes[-period:], ddof=1)
+    upper = sma+2*std; lower = sma-2*std; price = closes[-1]
+    bb_pct = (price-lower)/(upper-lower)*100 if upper != lower else 50
+    return {"upper": round(float(upper),6), "mid": round(float(sma),6), "lower": round(float(lower),6),
+            "bandwidth": round(float((upper-lower)/sma*100),2), "bb_pct": round(float(bb_pct),2)}
 
 def calc_atr(highs, lows, closes, period=14):
-    if len(closes) < period + 1:
-        return float(closes[-1] * 0.01)
-    tr_list = [
-        max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-        for i in range(1, len(closes))
-    ]
+    if len(closes) < period+1: return float(closes[-1]*0.01)
+    tr_list = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])) for i in range(1,len(closes))]
     atr = float(np.mean(tr_list[:period]))
-    for v in tr_list[period:]:
-        atr = (atr * (period - 1) + v) / period
+    for v in tr_list[period:]: atr = (atr*(period-1)+v)/period
     return round(atr, 6)
 
 def calc_stochastic(highs, lows, closes, k_period=14, d_period=3, smooth_k=3):
-    if len(closes) < k_period + smooth_k:
-        return None
+    if len(closes) < k_period+smooth_k: return None
     raw_k = []
-    for i in range(k_period - 1, len(closes)):
-        lo = np.min(lows[i - k_period + 1:i + 1])
-        hi = np.max(highs[i - k_period + 1:i + 1])
-        raw_k.append(100 * (closes[i] - lo) / (hi - lo) if hi != lo else 50)
-    sk = [float(np.mean(raw_k[i - smooth_k + 1:i + 1])) for i in range(smooth_k - 1, len(raw_k))]
-    if len(sk) < d_period:
-        return None
+    for i in range(k_period-1, len(closes)):
+        lo = np.min(lows[i-k_period+1:i+1]); hi = np.max(highs[i-k_period+1:i+1])
+        raw_k.append(100*(closes[i]-lo)/(hi-lo) if hi != lo else 50)
+    sk = [float(np.mean(raw_k[i-smooth_k+1:i+1])) for i in range(smooth_k-1, len(raw_k))]
+    if len(sk) < d_period: return None
     d = float(np.mean(sk[-d_period:]))
     cross = "none"
     if len(sk) >= 2:
         if sk[-2] < d and sk[-1] > d: cross = "bullish"
         elif sk[-2] > d and sk[-1] < d: cross = "bearish"
-    return {"k": round(sk[-1], 2), "d": round(d, 2), "cross": cross}
+    return {"k": round(sk[-1],2), "d": round(d,2), "cross": cross}
 
 def calc_vwap(highs, lows, closes, volumes):
-    typical = (highs + lows + closes) / 3
-    tv = np.sum(volumes)
-    return round(float(np.sum(typical * volumes) / tv), 6) if tv > 0 else float(closes[-1])
+    typical = (highs+lows+closes)/3; tv = np.sum(volumes)
+    return round(float(np.sum(typical*volumes)/tv),6) if tv > 0 else float(closes[-1])
 
 def calc_support_resistance(highs, lows, closes):
     pivot_highs, pivot_lows = [], []
-    for i in range(2, len(highs) - 2):
+    for i in range(2, len(highs)-2):
         if highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i+1] and highs[i] > highs[i+2]:
             pivot_highs.append(float(highs[i]))
         if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
             pivot_lows.append(float(lows[i]))
     price = float(closes[-1])
-    support    = float(np.min(lows[-20:]))   if not pivot_lows   else min(pivot_lows[-3:])
-    resistance = float(np.max(highs[-20:]))  if not pivot_highs  else max(pivot_highs[-3:])
+    support    = float(np.min(lows[-20:]))  if not pivot_lows   else min(pivot_lows[-3:])
+    resistance = float(np.max(highs[-20:])) if not pivot_highs  else max(pivot_highs[-3:])
     near_sup = max([l for l in pivot_lows  if l < price], default=support)
     near_res = min([h for h in pivot_highs if h > price], default=resistance)
-    return {
-        "support":         round(support, 6),
-        "resistance":      round(resistance, 6),
-        "near_support":    round(near_sup, 6),
-        "near_resistance": round(near_res, 6),
-    }
+    return {"support": round(support,6), "resistance": round(resistance,6),
+            "near_support": round(near_sup,6), "near_resistance": round(near_res,6)}
 
 def calc_adx(highs, lows, closes, period=14):
-    if len(closes) < period * 2:
-        return None
+    if len(closes) < period*2: return None
     pdm, mdm, tr_list = [], [], []
     for i in range(1, len(closes)):
-        hd = highs[i] - highs[i-1]; ld = lows[i-1] - lows[i]
-        pdm.append(hd if hd > ld and hd > 0 else 0)
-        mdm.append(ld if ld > hd and ld > 0 else 0)
-        tr_list.append(max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])))
+        hd = highs[i]-highs[i-1]; ld = lows[i-1]-lows[i]
+        pdm.append(hd if hd>ld and hd>0 else 0)
+        mdm.append(ld if ld>hd and ld>0 else 0)
+        tr_list.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
     def ws(arr, p):
         s = [sum(arr[:p])]
-        for v in arr[p:]: s.append(s[-1] - s[-1] / p + v)
+        for v in arr[p:]: s.append(s[-1]-s[-1]/p+v)
         return s
-    trs = ws(tr_list, period); pds = ws(pdm, period); mds = ws(mdm, period)
-    pdi = [100 * pds[i] / trs[i] if trs[i] != 0 else 0 for i in range(len(trs))]
-    mdi = [100 * mds[i] / trs[i] if trs[i] != 0 else 0 for i in range(len(trs))]
-    dx  = [100 * abs(pdi[i] - mdi[i]) / (pdi[i] + mdi[i]) if (pdi[i] + mdi[i]) != 0 else 0 for i in range(len(pdi))]
+    trs=ws(tr_list,period); pds=ws(pdm,period); mds=ws(mdm,period)
+    pdi=[100*pds[i]/trs[i] if trs[i]!=0 else 0 for i in range(len(trs))]
+    mdi=[100*mds[i]/trs[i] if trs[i]!=0 else 0 for i in range(len(trs))]
+    dx=[100*abs(pdi[i]-mdi[i])/(pdi[i]+mdi[i]) if (pdi[i]+mdi[i])!=0 else 0 for i in range(len(pdi))]
     adx_val = float(np.mean(dx[-period:]))
-    return {
-        "adx":   round(adx_val, 2),
-        "+di":   round(pdi[-1], 2),
-        "-di":   round(mdi[-1], 2),
-        "trend": "strong" if adx_val > 25 else ("moderate" if adx_val > 20 else "weak"),
-    }
+    return {"adx": round(adx_val,2), "+di": round(pdi[-1],2), "-di": round(mdi[-1],2),
+            "trend": "strong" if adx_val>25 else ("moderate" if adx_val>20 else "weak")}
 
 def calc_ichimoku(highs, lows, closes):
     if len(closes) < 52: return None
-    def mid(h, l): return (h + l) / 2
-    tenkan   = mid(np.max(highs[-9:]),  np.min(lows[-9:]))
-    kijun    = mid(np.max(highs[-26:]), np.min(lows[-26:]))
-    senkou_a = (tenkan + kijun) / 2
-    senkou_b = mid(np.max(highs[-52:]), np.min(lows[-52:]))
-    price = closes[-1]
-    sig = "neutral"
-    if price > max(senkou_a, senkou_b) and tenkan > kijun:   sig = "bullish"
-    elif price < min(senkou_a, senkou_b) and tenkan < kijun: sig = "bearish"
-    return {
-        "tenkan":   round(float(tenkan), 6),
-        "kijun":    round(float(kijun), 6),
-        "senkou_a": round(float(senkou_a), 6),
-        "senkou_b": round(float(senkou_b), 6),
-        "signal":   sig,
-    }
+    def mid(h,l): return (h+l)/2
+    tenkan  = mid(np.max(highs[-9:]),  np.min(lows[-9:]))
+    kijun   = mid(np.max(highs[-26:]), np.min(lows[-26:]))
+    sa = (tenkan+kijun)/2
+    sb = mid(np.max(highs[-52:]), np.min(lows[-52:]))
+    price = closes[-1]; sig = "neutral"
+    if price > max(sa,sb) and tenkan > kijun:   sig = "bullish"
+    elif price < min(sa,sb) and tenkan < kijun: sig = "bearish"
+    tk_cross = "none"
+    if len(closes) >= 2:
+        prev_tk_above = highs[-2] > kijun
+        curr_tk_above = tenkan > kijun
+        if not prev_tk_above and curr_tk_above: tk_cross = "bullish"
+        elif prev_tk_above and not curr_tk_above: tk_cross = "bearish"
+    return {"tenkan": round(float(tenkan),6), "kijun": round(float(kijun),6),
+            "senkou_a": round(float(sa),6), "senkou_b": round(float(sb),6),
+            "signal": sig, "tk_cross": tk_cross}
 
 def detect_divergence(closes, rsi_series, lookback=14):
-    if not rsi_series or len(rsi_series) < lookback or len(closes) < lookback:
-        return "none"
+    if not rsi_series or len(rsi_series) < lookback or len(closes) < lookback: return "none"
     rc = closes[-lookback:]; rr = rsi_series[-lookback:]
-    ph = np.argmax(rc); pl = np.argmin(rc)
-    half = len(rc) // 2
-    if ph > half:
-        if rr[ph] < np.max(rr[:half]) - 5: return "bearish_divergence"
-    if pl > half:
-        if rr[pl] > np.min(rr[:half]) + 5: return "bullish_divergence"
+    ph = np.argmax(rc); pl = np.argmin(rc); half = len(rc)//2
+    if ph > half and rr[ph] < np.max(rr[:half])-5: return "bearish_divergence"
+    if pl > half and rr[pl] > np.min(rr[:half])+5: return "bullish_divergence"
     return "none"
 
 def calc_volume_profile(closes, volumes, lookback=20):
-    if len(volumes) < lookback: return {"trend": "neutral", "ratio": 1.0}
-    avg    = float(np.mean(volumes[-lookback*2:-lookback])) if len(volumes) >= lookback*2 else float(np.mean(volumes))
+    if len(volumes) < lookback: return {"trend":"neutral","ratio":1.0}
+    avg    = float(np.mean(volumes[-lookback*2:-lookback])) if len(volumes)>=lookback*2 else float(np.mean(volumes))
     recent = float(np.mean(volumes[-lookback:]))
-    ratio  = recent / avg if avg > 0 else 1.0
-    up = sum(volumes[i] for i in range(-lookback, 0) if closes[i] > closes[i-1])
-    dn = sum(volumes[i] for i in range(-lookback, 0) if closes[i] < closes[i-1])
-    trend = "bullish" if up > dn * 1.2 else ("bearish" if dn > up * 1.2 else "neutral")
-    return {"trend": trend, "ratio": round(float(ratio), 2)}
+    ratio  = recent/avg if avg > 0 else 1.0
+    up = sum(volumes[i] for i in range(-lookback,0) if closes[i]>closes[i-1])
+    dn = sum(volumes[i] for i in range(-lookback,0) if closes[i]<closes[i-1])
+    trend = "bullish" if up>dn*1.2 else ("bearish" if dn>up*1.2 else "neutral")
+    return {"trend": trend, "ratio": round(float(ratio),2)}
+
+# =========================
+# FAIR VALUE GAP (FVG)
+# =========================
+def calc_fvg(highs, lows, closes, lookback=30):
+    """
+    تشخیص Fair Value Gap — ناحیه‌های پر نشده قیمتی
+    FVG صعودی: low کندل سوم > high کندل اول
+    FVG نزولی: high کندل سوم < low کندل اول
+    """
+    if len(closes) < lookback + 3: return {"bullish": [], "bearish": [], "nearest": None, "signal": "none"}
+    price = float(closes[-1])
+    bullish_fvgs = []
+    bearish_fvgs = []
+    for i in range(len(closes)-lookback, len(closes)-2):
+        if i < 1: continue
+        # FVG صعودی: gap بین high کندل i-1 و low کندل i+1
+        if lows[i+1] > highs[i-1]:
+            gap_low  = float(highs[i-1])
+            gap_high = float(lows[i+1])
+            mid = (gap_low + gap_high) / 2
+            bullish_fvgs.append({"low": round(gap_low,6), "high": round(gap_high,6), "mid": round(mid,6), "idx": i})
+        # FVG نزولی: gap بین low کندل i-1 و high کندل i+1
+        if highs[i+1] < lows[i-1]:
+            gap_high = float(lows[i-1])
+            gap_low  = float(highs[i+1])
+            mid = (gap_low + gap_high) / 2
+            bearish_fvgs.append({"low": round(gap_low,6), "high": round(gap_high,6), "mid": round(mid,6), "idx": i})
+
+    # نزدیک‌ترین FVG به قیمت فعلی
+    nearest = None; nearest_dist = float("inf"); signal = "none"
+    for fvg in bullish_fvgs[-5:]:
+        if fvg["low"] < price:
+            dist = abs(price - fvg["mid"]) / price * 100
+            if dist < nearest_dist:
+                nearest_dist = dist; nearest = fvg; nearest = {**fvg, "type": "bullish"}
+    for fvg in bearish_fvgs[-5:]:
+        if fvg["high"] > price:
+            dist = abs(price - fvg["mid"]) / price * 100
+            if dist < nearest_dist:
+                nearest_dist = dist; nearest = {**fvg, "type": "bearish"}; nearest_dist = dist
+
+    if nearest:
+        if nearest["type"] == "bullish" and nearest_dist < 2.0: signal = "in_bullish_fvg"
+        elif nearest["type"] == "bearish" and nearest_dist < 2.0: signal = "in_bearish_fvg"
+        elif nearest["type"] == "bullish" and nearest_dist < 5.0: signal = "near_bullish_fvg"
+        elif nearest["type"] == "bearish" and nearest_dist < 5.0: signal = "near_bearish_fvg"
+
+    return {
+        "bullish": bullish_fvgs[-3:],
+        "bearish": bearish_fvgs[-3:],
+        "nearest": nearest,
+        "nearest_dist": round(nearest_dist, 2) if nearest_dist != float("inf") else None,
+        "signal": signal,
+    }
+
+# =========================
+# ORDER FLOW IMBALANCE
+# =========================
+def calc_order_flow(opens, closes, highs, lows, volumes, lookback=20):
+    """
+    تشخیص فشار خرید/فروش از روی کندل‌ها و حجم
+    Delta = حجم خرید - حجم فروش (تخمین)
+    """
+    if len(closes) < lookback: return {"delta": 0, "bias": "neutral", "strength": 0, "cumulative": 0}
+    
+    deltas = []
+    for i in range(-lookback, 0):
+        o = float(opens[i]); c = float(closes[i])
+        h = float(highs[i]); l = float(lows[i])
+        v = float(volumes[i])
+        body_pct = abs(c - o) / (h - l) if (h - l) > 0 else 0
+        # تخمین: کندل صعودی = فشار خرید، نزولی = فشار فروش
+        if c > o:
+            buy_vol  = v * (0.5 + body_pct * 0.5)
+            sell_vol = v * (0.5 - body_pct * 0.5)
+        else:
+            sell_vol = v * (0.5 + body_pct * 0.5)
+            buy_vol  = v * (0.5 - body_pct * 0.5)
+        deltas.append(buy_vol - sell_vol)
+
+    cumulative = sum(deltas)
+    recent_5   = sum(deltas[-5:])
+    avg_abs    = float(np.mean(np.abs(deltas))) if deltas else 1
+
+    strength = abs(recent_5) / avg_abs if avg_abs > 0 else 0
+    bias = "bullish" if recent_5 > 0 else ("bearish" if recent_5 < 0 else "neutral")
+    
+    # imbalance شدید
+    imbalance = "strong_bullish" if strength > 2.0 and bias=="bullish" else \
+                ("strong_bearish" if strength > 2.0 and bias=="bearish" else bias)
+
+    return {
+        "delta":      round(float(recent_5), 2),
+        "cumulative": round(float(cumulative), 2),
+        "bias":       bias,
+        "imbalance":  imbalance,
+        "strength":   round(float(strength), 2),
+    }
+
+# =========================
+# POINT OF CONTROL (POC) / VOLUME PROFILE
+# =========================
+def calc_poc(highs, lows, closes, volumes, lookback=50, bins=20):
+    """
+    Point of Control — قیمتی که بیشترین حجم معامله داشته
+    این سطح حمایت/مقاومت واقعیه
+    """
+    if len(closes) < lookback: return None
+    h = highs[-lookback:]; l = lows[-lookback:]
+    v = volumes[-lookback:]; c = closes[-lookback:]
+    
+    price_min = float(np.min(l)); price_max = float(np.max(h))
+    if price_max <= price_min: return None
+    
+    bin_size = (price_max - price_min) / bins
+    vol_bins = np.zeros(bins)
+    for i in range(len(c)):
+        typical = (float(h[i]) + float(l[i]) + float(c[i])) / 3
+        bin_idx = int((typical - price_min) / bin_size)
+        bin_idx = min(bin_idx, bins-1)
+        vol_bins[bin_idx] += float(v[i])
+
+    poc_bin   = int(np.argmax(vol_bins))
+    poc_price = price_min + (poc_bin + 0.5) * bin_size
+    
+    # VAH و VAL (Value Area High/Low) — ۷۰٪ حجم
+    total_vol = np.sum(vol_bins)
+    target    = total_vol * 0.70
+    cumvol    = 0; vah_bin = poc_bin; val_bin = poc_bin
+    for _ in range(bins):
+        up_vol = vol_bins[vah_bin+1] if vah_bin+1 < bins else 0
+        dn_vol = vol_bins[val_bin-1] if val_bin-1 >= 0 else 0
+        if up_vol >= dn_vol and vah_bin+1 < bins:
+            vah_bin += 1; cumvol += up_vol
+        elif val_bin-1 >= 0:
+            val_bin -= 1; cumvol += dn_vol
+        else: break
+        if cumvol >= target: break
+
+    vah = price_min + (vah_bin + 1) * bin_size
+    val = price_min + val_bin * bin_size
+    price = float(closes[-1])
+
+    return {
+        "poc":       round(poc_price, 6),
+        "vah":       round(vah, 6),
+        "val":       round(val, 6),
+        "dist_poc":  round(abs(price - poc_price) / price * 100, 2),
+        "above_poc": price > poc_price,
+        "in_value_area": val <= price <= vah,
+    }
+
+# =========================
+# WHALE ALERT (on-chain بزرگ)
+# =========================
+async def get_whale_alerts(symbol):
+    """
+    تراکنش‌های بزرگ از whale-alert.io (API رایگان محدود)
+    fallback: از CryptoCompare آنچین چک می‌کنیم
+    """
+    try:
+        coin = symbol.replace("USDT","").lower()
+        # از CryptoCompare برای تراکنش‌های بزرگ
+        url = f"https://min-api.cryptocompare.com/data/blockchain/histo/day?fsym={coin.upper()}&limit=1"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status != 200: return None
+            d = await r.json()
+            if d.get("Response") != "Success": return None
+            today = d["Data"]["Data"][-1] if d["Data"]["Data"] else {}
+            tx_count     = today.get("transaction_count", 0)
+            active_addr  = today.get("active_addresses", 0)
+            large_tx     = today.get("large_transaction_count", 0)
+            # نرمال‌سازی
+            return {
+                "large_tx":    large_tx,
+                "active_addr": active_addr,
+                "tx_count":    tx_count,
+                "bullish":     large_tx > 500 or active_addr > 100000,
+                "alert":       large_tx > 1000,
+            }
+    except Exception as e:
+        log.warning(f"WhaleAlert {symbol}: {e}")
+        return None
 
 def detect_candle_patterns(opens, closes, highs, lows):
     patterns = []
     if len(closes) < 3: return ["داده کافی نیست"]
-    o, c, h, l = float(opens[-1]), float(closes[-1]), float(highs[-1]), float(lows[-1])
-    body  = abs(c - o); total = h - l if h != l else 0.0001
-    upper = h - max(o, c); lower = min(o, c) - l
-    if body / total < 0.1: patterns.append("Doji ⚖️")
-    if lower > body * 2 and upper < body * 0.3 and body / total > 0.05:
-        patterns.append("Hammer 🔨" if c > o else "Hanging Man 🪢")
-    if upper > body * 2 and lower < body * 0.3 and body / total > 0.05:
-        patterns.append("Shooting Star ⭐" if c < o else "Inverted Hammer 🔁")
-    if body / total > 0.8:
-        patterns.append("Marubozu صعودی 💚" if c > o else "Marubozu نزولی 🔴")
-    if len(closes) >= 2:
-        po, pc = float(opens[-2]), float(closes[-2])
-        if c > o and pc < po and c > po and o < pc: patterns.append("Bullish Engulfing 🟢")
-        if c < o and pc > po and c < po and o > pc: patterns.append("Bearish Engulfing 🔴")
-    if len(closes) >= 3:
-        o3, c3 = float(opens[-3]), float(closes[-3])
-        o2, c2 = float(opens[-2]), float(closes[-2])
-        if c3 > o3 and abs(c2 - o2) / (highs[-2] - lows[-2] + 0.0001) < 0.3 and c < o and c < (c3 + o3) / 2:
+    o,c,h,l = float(opens[-1]),float(closes[-1]),float(highs[-1]),float(lows[-1])
+    body=abs(c-o); total=h-l if h!=l else 0.0001
+    upper=h-max(o,c); lower=min(o,c)-l
+    if body/total < 0.1: patterns.append("Doji ⚖️")
+    if lower>body*2 and upper<body*0.3 and body/total>0.05:
+        patterns.append("Hammer 🔨" if c>o else "Hanging Man 🪢")
+    if upper>body*2 and lower<body*0.3 and body/total>0.05:
+        patterns.append("Shooting Star ⭐" if c<o else "Inverted Hammer 🔁")
+    if body/total > 0.8:
+        patterns.append("Marubozu صعودی 💚" if c>o else "Marubozu نزولی 🔴")
+    if len(closes)>=2:
+        po,pc=float(opens[-2]),float(closes[-2])
+        if c>o and pc<po and c>po and o<pc: patterns.append("Bullish Engulfing 🟢")
+        if c<o and pc>po and c<po and o>pc: patterns.append("Bearish Engulfing 🔴")
+    if len(closes)>=3:
+        o3,c3=float(opens[-3]),float(closes[-3]); o2,c2=float(opens[-2]),float(closes[-2])
+        if c3>o3 and abs(c2-o2)/(highs[-2]-lows[-2]+0.0001)<0.3 and c<o and c<(c3+o3)/2:
             patterns.append("Evening Star 🌆")
-        if c3 < o3 and abs(c2 - o2) / (highs[-2] - lows[-2] + 0.0001) < 0.3 and c > o and c > (c3 + o3) / 2:
+        if c3<o3 and abs(c2-o2)/(highs[-2]-lows[-2]+0.0001)<0.3 and c>o and c>(c3+o3)/2:
             patterns.append("Morning Star 🌅")
     return patterns if patterns else ["کندل خنثی"]
 
 # =========================
-# MONEY MANAGEMENT ENGINE
+# MARKET STRUCTURE — جدید
 # =========================
-def calc_position_size(capital, entry, stop_loss, confidence, mode_key, signal_score, agreement_pct):
-    mode = TRADING_MODES[mode_key]
-    base_risk_pct = mode["risk_pct"]
-    if agreement_pct >= 85:
-        agreement_factor = 1.3
-    elif agreement_pct >= 78:
-        agreement_factor = 1.15
-    elif agreement_pct >= 70:
-        agreement_factor = 1.0
-    else:
-        agreement_factor = 0.7
-    adjusted_risk_pct = min(base_risk_pct * agreement_factor, 5.0)
-    risk_amount = capital * (adjusted_risk_pct / 100)
-    sl_distance_pct = abs(entry - stop_loss) / entry * 100
-    if sl_distance_pct <= 0:
-        sl_distance_pct = 1.0
-    position_size = risk_amount / (sl_distance_pct / 100)
-    position_pct  = min((position_size / capital) * 100, 50.0)
-    coin_amount   = position_size / entry if entry > 0 else 0
-    return {
-        "risk_pct":          round(adjusted_risk_pct, 2),
-        "risk_amount":       round(risk_amount, 2),
-        "position_pct":      round(position_pct, 2),
-        "position_size_usd": round(position_size, 2),
-        "coin_amount":       round(coin_amount, 6),
-        "sl_distance_pct":   round(sl_distance_pct, 2),
-        "advice":            _get_risk_advice(adjusted_risk_pct, agreement_pct, mode_key),
-    }
+def calc_market_structure(highs, lows, closes, lookback=50):
+    """تشخیص HH/HL/LL/LH برای مید و لانگ‌تم"""
+    if len(closes) < lookback: return {"structure": "unknown", "bias": "neutral"}
+    h = highs[-lookback:]; l = lows[-lookback:]
+    # پیدا کردن swing high/low
+    swing_highs = []; swing_lows = []
+    for i in range(2, len(h)-2):
+        if h[i] > h[i-1] and h[i] > h[i-2] and h[i] > h[i+1] and h[i] > h[i+2]:
+            swing_highs.append((i, float(h[i])))
+        if l[i] < l[i-1] and l[i] < l[i-2] and l[i] < l[i+1] and l[i] < l[i+2]:
+            swing_lows.append((i, float(l[i])))
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return {"structure": "unclear", "bias": "neutral"}
+    hh = swing_highs[-1][1] > swing_highs[-2][1]  # Higher High
+    hl = swing_lows[-1][1]  > swing_lows[-2][1]   # Higher Low
+    ll = swing_lows[-1][1]  < swing_lows[-2][1]   # Lower Low
+    lh = swing_highs[-1][1] < swing_highs[-2][1]  # Lower High
+    if hh and hl:   structure = "HH+HL 📈"; bias = "bullish"
+    elif ll and lh: structure = "LL+LH 📉"; bias = "bearish"
+    elif hh and ll: structure = "HH+LL ⚡"; bias = "choppy"
+    else:           structure = "رنج ↔️";   bias = "neutral"
+    bos = "none"  # Break of Structure
+    if len(swing_highs) >= 2 and closes[-1] > swing_highs[-2][1]: bos = "bullish_bos"
+    elif len(swing_lows) >= 2 and closes[-1] < swing_lows[-2][1]: bos = "bearish_bos"
+    return {"structure": structure, "bias": bias, "bos": bos,
+            "last_high": round(swing_highs[-1][1],6) if swing_highs else None,
+            "last_low":  round(swing_lows[-1][1],6)  if swing_lows  else None}
 
-def _get_risk_advice(risk_pct, agreement_pct, mode_key):
-    advices = []
-    if risk_pct <= 1.0:
-        advices.append("✅ ریسک محافظه‌کارانه — مناسب برای بازار نامطمئن")
-    elif risk_pct <= 2.5:
-        advices.append("✅ ریسک متعادل — استاندارد برای این بازه")
-    else:
-        advices.append("⚠️ ریسک بالا — فقط با سرمایه‌ای که از دست دادنش مشکلی نداری")
-    if agreement_pct < 75:
-        advices.append("⚠️ هم‌راستایی تایم‌فریم‌ها پایینه — ورود با احتیاط")
-    if mode_key == "scalp":
-        advices.append("💡 اسکالپ: حتماً لیمیت اوردر بذار، نه مارکت")
-    elif mode_key == "long":
-        advices.append("💡 بلندمدت: DCA (خرید پله‌ای) رو در نظر بگیر")
-    advices.append("📌 هرگز بیشتر از ۵٪ سرمایه کل رو در یک معامله ریسک نکن")
-    return advices
+# =========================
+# MODE-SPECIFIC SCORING ENGINES
+# =========================
 
-def build_mm_section(capital, analysis):
-    if not capital or analysis["direction"] == "NEUTRAL ⚪" or not analysis["stop_loss"]:
-        return ""
-    mm = calc_position_size(
-        capital=capital, entry=analysis["entry"], stop_loss=analysis["stop_loss"],
-        confidence=analysis["confidence"], mode_key=analysis["mode"],
-        signal_score=analysis["score"], agreement_pct=analysis["agreement"],
-    )
-    tp1_pct = abs(analysis["tp1"] - analysis["entry"]) / analysis["entry"] * 100 if analysis["tp1"] else 0
-    rr = round(tp1_pct / mm["sl_distance_pct"], 2) if mm["sl_distance_pct"] > 0 else 0
-    msg  = f"\n💼 مدیریت سرمایه:\n"
-    msg += f"━━━━━━━━━━━━━━━\n"
-    msg += f"💰 سرمایه کل:        ${capital:,.0f}\n"
-    msg += f"📊 حجم پیشنهادی:     {mm['position_pct']}٪  ≈ ${mm['position_size_usd']:,.0f}\n"
-    msg += f"🎲 ریسک این معامله:  {mm['risk_pct']}٪  ≈ ${mm['risk_amount']:,.0f}\n"
-    msg += f"📏 فاصله استاپ:      {mm['sl_distance_pct']}٪\n"
-    msg += f"🪙 مقدار خرید:       {mm['coin_amount']} واحد\n"
-    msg += f"⚖️ نسبت R/R:         1:{rr}\n"
-    msg += f"\n💡 توصیه‌ها:\n"
-    for a in mm["advice"]:
-        msg += f"  {a}\n"
-    return msg
+def score_scalp(indicators, price):
+    """
+    اسکالپ: Stochastic + VWAP + BB + Volume + کندل اولویت دارند
+    سرعت ورود مهمه — باید فوری سیگنال بده
+    """
+    votes = []
+    def v(r, s): votes.append((r, s))
+
+    ind = indicators
+    stoch  = ind.get("stoch")
+    bb     = ind.get("bb")
+    vwap   = ind.get("vwap")
+    vol    = ind.get("vol")
+    rsi    = ind.get("rsi", 50)
+    macd   = ind.get("macd")
+    pats   = ind.get("patterns", [])
+
+    # Stochastic — مهم‌ترین برای اسکالپ
+    if stoch:
+        if stoch["k"] < 20 and stoch["cross"] == "bullish":   v("کراس صعودی استوک اشباع فروش", +3)
+        elif stoch["k"] < 20:                                  v("استوک اشباع فروش", +2)
+        elif stoch["k"] > 80 and stoch["cross"] == "bearish": v("کراس نزولی استوک اشباع خرید", -3)
+        elif stoch["k"] > 80:                                  v("استوک اشباع خرید", -2)
+        elif stoch["cross"] == "bullish":                      v("کراس صعودی استوک", +1)
+        elif stoch["cross"] == "bearish":                      v("کراس نزولی استوک", -1)
+        else:                                                   v("استوک خنثی", 0)
+
+    # VWAP — فیلتر جهت
+    if vwap:
+        if price > vwap * 1.003:   v("قیمت بالای VWAP — momentum صعودی", +2)
+        elif price < vwap * 0.997: v("قیمت زیر VWAP — momentum نزولی", -2)
+        elif price > vwap:         v("کمی بالای VWAP", +1)
+        else:                      v("کمی زیر VWAP", -1)
+
+    # Bollinger — ورود از باند
+    if bb:
+        if bb["bb_pct"] < 5:   v("لمس باند پایین — bounce احتمالی", +3)
+        elif bb["bb_pct"] < 15: v("نزدیک باند پایین", +2)
+        elif bb["bb_pct"] > 95: v("لمس باند بالا — pullback احتمالی", -3)
+        elif bb["bb_pct"] > 85: v("نزدیک باند بالا", -2)
+        elif bb["bandwidth"] < 1.5: v("BB فشرده — breakout در راهه", 0)
+        else:                   v("BB خنثی", 0)
+
+    # Volume — تأیید حجم برای اسکالپ حیاتیه
+    if vol:
+        if vol["ratio"] > 2.0 and vol["trend"] == "bullish":   v("حجم بسیار بالا صعودی ✅", +3)
+        elif vol["ratio"] > 1.5 and vol["trend"] == "bullish": v("حجم بالا صعودی", +2)
+        elif vol["ratio"] > 2.0 and vol["trend"] == "bearish": v("حجم بسیار بالا نزولی ✅", -3)
+        elif vol["ratio"] > 1.5 and vol["trend"] == "bearish": v("حجم بالا نزولی", -2)
+        elif vol["ratio"] < 0.7: v("حجم پایین — سیگنال ضعیف ⚠️", 0)
+        else:                    v("حجم معمولی", 0)
+
+    # RSI — فقط اشباع‌ها مهمن
+    if rsi <= 25:   v("RSI اشباع فروش شدید", +2)
+    elif rsi >= 75: v("RSI اشباع خرید شدید", -2)
+    else:           v("RSI خنثی (اسکالپ)", 0)
+
+    # MACD — کراس
+    if macd:
+        if macd["cross"] == "bullish_cross":   v("کراس صعودی MACD", +1)
+        elif macd["cross"] == "bearish_cross": v("کراس نزولی MACD", -1)
+
+    # الگوهای کندل
+    bullish_pats = ["Hammer 🔨","Bullish Engulfing 🟢","Morning Star 🌅","Inverted Hammer 🔁"]
+    bearish_pats = ["Shooting Star ⭐","Bearish Engulfing 🔴","Evening Star 🌆","Hanging Man 🪢"]
+    for p in pats:
+        if p in bullish_pats: v(f"الگو {p}", +2)
+        elif p in bearish_pats: v(f"الگو {p}", -2)
+
+    # Order Flow — برای اسکالپ خیلی مهمه
+    of = ind.get("order_flow")
+    if of:
+        if of["imbalance"] == "strong_bullish": v("Order Flow: فشار خرید قوی 🟢", +3)
+        elif of["imbalance"] == "strong_bearish": v("Order Flow: فشار فروش قوی 🔴", -3)
+        elif of["bias"] == "bullish": v("Order Flow: فشار خرید", +1)
+        elif of["bias"] == "bearish": v("Order Flow: فشار فروش", -1)
+
+    # FVG — نواحی جذب قیمت
+    fvg = ind.get("fvg")
+    if fvg:
+        sig = fvg.get("signal","none")
+        if sig == "in_bullish_fvg":    v("قیمت داخل FVG صعودی — bounce احتمالی", +3)
+        elif sig == "near_bullish_fvg": v("نزدیک FVG صعودی", +2)
+        elif sig == "in_bearish_fvg":   v("قیمت داخل FVG نزولی — rejection احتمالی", -3)
+        elif sig == "near_bearish_fvg": v("نزدیک FVG نزولی", -2)
+
+    # POC — قیمت نسبت به POC
+    poc = ind.get("poc")
+    if poc:
+        if poc["dist_poc"] < 0.5:
+            v("قیمت روی POC — ناحیه بحرانی ⚡", +1 if poc["above_poc"] else -1)
+        elif poc["above_poc"] and poc["dist_poc"] < 2.0:
+            v("کمی بالای POC — حمایت قوی زیر", +1)
+        elif not poc["above_poc"] and poc["dist_poc"] < 2.0:
+            v("کمی زیر POC — مقاومت قوی بالا", -1)
+
+    return votes
+
+def score_short(indicators, price):
+    """
+    کوتاه‌مدت: RSI + MACD + BB + ADX + Stoch
+    تعادل بین سرعت و اطمینان
+    """
+    votes = []
+    def v(r, s): votes.append((r, s))
+
+    rsi    = indicators.get("rsi", 50)
+    macd   = indicators.get("macd")
+    bb     = indicators.get("bb")
+    stoch  = indicators.get("stoch")
+    adx    = indicators.get("adx")
+    vwap   = indicators.get("vwap")
+    div    = indicators.get("divergence", "none")
+    ich    = indicators.get("ichimoku")
+    ema20  = indicators.get("ema20")
+    ema50  = indicators.get("ema50")
+    vol    = indicators.get("vol")
+
+    # RSI — مهم‌ترین
+    if   rsi <= 30: v("RSI اشباع فروش شدید", +2)
+    elif rsi <= 40: v("RSI نزدیک اشباع فروش", +1)
+    elif rsi >= 70: v("RSI اشباع خرید شدید", -2)
+    elif rsi >= 60: v("RSI نزدیک اشباع خرید", -1)
+    else:           v("RSI خنثی", 0)
+
+    # MACD
+    if macd:
+        if   macd["cross"] == "bullish_cross":  v("کراس صعودی MACD", +3)
+        elif macd["cross"] == "bearish_cross":  v("کراس نزولی MACD", -3)
+        elif macd["histogram"] > 0 and macd["prev_hist"] > 0: v("MACD هیستوگرام مثبت رو به رشد", +1)
+        elif macd["histogram"] < 0 and macd["prev_hist"] < 0: v("MACD هیستوگرام منفی رو به افت", -1)
+        else: v("MACD خنثی", 0)
+
+    # Bollinger
+    if bb:
+        if   bb["bb_pct"] < 10: v("زیر باند پایین BB", +2)
+        elif bb["bb_pct"] < 25: v("نزدیک باند پایین BB", +1)
+        elif bb["bb_pct"] > 90: v("بالای باند بالای BB", -2)
+        elif bb["bb_pct"] > 75: v("نزدیک باند بالای BB", -1)
+        else: v("BB خنثی", 0)
+
+    # Stochastic
+    if stoch:
+        if stoch["k"] < 20 and stoch["cross"] == "bullish": v("کراس صعودی استوک اشباع فروش", +2)
+        elif stoch["k"] > 80 and stoch["cross"] == "bearish": v("کراس نزولی استوک اشباع خرید", -2)
+        elif stoch["k"] < 20: v("استوک اشباع فروش", +1)
+        elif stoch["k"] > 80: v("استوک اشباع خرید", -1)
+        else: v("استوک خنثی", 0)
+
+    # ADX — قدرت روند
+    if adx:
+        if adx["adx"] > 25:
+            w = 2 if adx["adx"] > 35 else 1
+            if adx["+di"] > adx["-di"]: v(f"ADX روند صعودی ({adx['adx']:.0f})", +w)
+            else:                        v(f"ADX روند نزولی ({adx['adx']:.0f})", -w)
+        else: v("ADX بازار ضعیف/رنج", 0)
+
+    # VWAP
+    if vwap:
+        if price > vwap*1.002: v("بالای VWAP", +1)
+        elif price < vwap*0.998: v("زیر VWAP", -1)
+
+    # EMA Cross
+    if ema20 and ema50:
+        if ema20 > ema50 and price > ema20:  v("EMA20>EMA50 قیمت بالا", +2)
+        elif ema20 < ema50 and price < ema20: v("EMA20<EMA50 قیمت پایین", -2)
+        elif price > ema20: v("بالای EMA20", +1)
+        else: v("زیر EMA20", -1)
+
+    # Divergence
+    if div == "bullish_divergence":  v("واگرایی مثبت RSI", +3)
+    elif div == "bearish_divergence": v("واگرایی منفی RSI", -3)
+
+    # Volume
+    if vol and vol["ratio"] > 1.5:
+        if vol["trend"] == "bullish": v("حجم صعودی بالا", +1)
+        elif vol["trend"] == "bearish": v("حجم نزولی بالا", -1)
+
+    # Order Flow
+    of = indicators.get("order_flow")
+    if of:
+        if of["imbalance"] == "strong_bullish": v("Order Flow: فشار خرید قوی", +2)
+        elif of["imbalance"] == "strong_bearish": v("Order Flow: فشار فروش قوی", -2)
+        elif of["bias"] == "bullish" and of["strength"] > 1.2: v("Order Flow: خریداران غالب", +1)
+        elif of["bias"] == "bearish" and of["strength"] > 1.2: v("Order Flow: فروشندگان غالب", -1)
+
+    # FVG
+    fvg = indicators.get("fvg")
+    if fvg:
+        sig = fvg.get("signal","none")
+        if sig == "in_bullish_fvg":    v("قیمت داخل FVG صعودی", +2)
+        elif sig == "near_bullish_fvg": v("نزدیک FVG صعودی", +1)
+        elif sig == "in_bearish_fvg":   v("قیمت داخل FVG نزولی", -2)
+        elif sig == "near_bearish_fvg": v("نزدیک FVG نزولی", -1)
+
+    # POC
+    poc = indicators.get("poc")
+    if poc:
+        if poc["dist_poc"] < 1.0:
+            v("قیمت روی POC ⚡", +1 if poc["above_poc"] else -1)
+        elif poc["above_poc"]: v("بالای POC — حمایت زیر", +1)
+        else: v("زیر POC — مقاومت بالا", -1)
+
+    return votes
+
+def score_mid(indicators, price):
+    """
+    میان‌مدت: Ichimoku + EMA + Market Structure + ADX + Divergence
+    نیاز به تأیید چند ابزار همزمان
+    """
+    votes = []
+    def v(r, s): votes.append((r, s))
+
+    ich  = indicators.get("ichimoku")
+    adx  = indicators.get("adx")
+    div  = indicators.get("divergence", "none")
+    ms   = indicators.get("market_structure", {})
+    ema20 = indicators.get("ema20")
+    ema50 = indicators.get("ema50")
+    ema200 = indicators.get("ema200")
+    rsi  = indicators.get("rsi", 50)
+    macd = indicators.get("macd")
+    vol  = indicators.get("vol")
+    sr   = indicators.get("sr")
+
+    # Ichimoku — مهم‌ترین برای میان‌مدت
+    if ich:
+        if ich["signal"] == "bullish":
+            w = 3
+            if ich["tk_cross"] == "bullish": w += 1
+            v(f"ایچیموکو صعودی (TK Cross: {ich['tk_cross']})", +w)
+        elif ich["signal"] == "bearish":
+            w = 3
+            if ich["tk_cross"] == "bearish": w += 1
+            v(f"ایچیموکو نزولی (TK Cross: {ich['tk_cross']})", -w)
+        else:
+            v("ایچیموکو داخل کومو (خنثی)", 0)
+
+    # Market Structure
+    if ms:
+        if ms["bias"] == "bullish":     v(f"ساختار بازار: {ms['structure']}", +3)
+        elif ms["bias"] == "bearish":   v(f"ساختار بازار: {ms['structure']}", -3)
+        elif ms["bias"] == "choppy":    v("ساختار چاپی — احتیاط ⚠️", 0)
+        if ms.get("bos") == "bullish_bos": v("شکست ساختار صعودی (BOS)", +2)
+        elif ms.get("bos") == "bearish_bos": v("شکست ساختار نزولی (BOS)", -2)
+
+    # EMA Stack
+    if ema200:
+        v("بالای EMA200 — روند کلی صعودی", +2) if price > ema200 else v("زیر EMA200 — روند کلی نزولی", -2)
+    if ema50 and ema20:
+        if ema20 > ema50 and price > ema50: v("EMA20>EMA50 قیمت بالا", +2)
+        elif ema20 < ema50 and price < ema50: v("EMA20<EMA50 قیمت پایین", -2)
+
+    # ADX
+    if adx and adx["adx"] > 20:
+        w = 2 if adx["adx"] > 30 else 1
+        if adx["+di"] > adx["-di"]: v(f"ADX قوی صعودی ({adx['adx']:.0f})", +w)
+        else:                        v(f"ADX قوی نزولی ({adx['adx']:.0f})", -w)
+
+    # Divergence — خیلی مهم برای میان‌مدت
+    if div == "bullish_divergence":   v("واگرایی مثبت RSI", +4)
+    elif div == "bearish_divergence": v("واگرایی منفی RSI", -4)
+
+    # RSI
+    if   rsi <= 35: v("RSI اشباع فروش", +2)
+    elif rsi >= 65: v("RSI اشباع خرید", -2)
+
+    # MACD
+    if macd:
+        if macd["cross"] == "bullish_cross": v("کراس صعودی MACD", +2)
+        elif macd["cross"] == "bearish_cross": v("کراس نزولی MACD", -2)
+
+    # Volume Profile
+    if vol and vol["ratio"] > 1.3:
+        if vol["trend"] == "bullish": v("حجم صعودی بالا", +1)
+        elif vol["trend"] == "bearish": v("حجم نزولی بالا", -1)
+
+    # نزدیک حمایت/مقاومت
+    if sr:
+        dist_sup = abs(price-sr["near_support"])/price*100
+        dist_res = abs(price-sr["near_resistance"])/price*100
+        if dist_sup < 2.0: v("نزدیک حمایت میان‌مدت", +2)
+        elif dist_res < 2.0: v("نزدیک مقاومت میان‌مدت", -2)
+
+    # FVG — برای میان‌مدت ناحیه supply/demand مهمه
+    fvg = indicators.get("fvg")
+    if fvg:
+        sig = fvg.get("signal","none")
+        if sig in ("in_bullish_fvg","near_bullish_fvg"):   v("FVG صعودی — ناحیه تقاضا", +2)
+        elif sig in ("in_bearish_fvg","near_bearish_fvg"): v("FVG نزولی — ناحیه عرضه", -2)
+
+    # POC — برای میان‌مدت خیلی مهمه
+    poc = indicators.get("poc")
+    if poc:
+        if poc["in_value_area"]:
+            v("قیمت داخل Value Area — احتمال رنج", 0)
+        elif poc["above_poc"]:
+            v("بالای POC و Value Area — روند صعودی تأیید", +2)
+        else:
+            v("زیر POC و Value Area — روند نزولی تأیید", -2)
+
+    # Order Flow
+    of = indicators.get("order_flow")
+    if of and of["strength"] > 1.5:
+        if of["bias"] == "bullish": v("Order Flow میان‌مدت: خریداران غالب", +2)
+        elif of["bias"] == "bearish": v("Order Flow میان‌مدت: فروشندگان غالب", -2)
+
+    return votes
+
+def score_long(indicators, price):
+    """
+    بلندمدت: EMA200 + Market Structure + Ichimoku + Volume Profile
+    فقط تأییدهای قوی — سیگنال کمتر ولی با اطمینان بالاتر
+    """
+    votes = []
+    def v(r, s): votes.append((r, s))
+
+    ema200 = indicators.get("ema200")
+    ema50  = indicators.get("ema50")
+    ema20  = indicators.get("ema20")
+    ms     = indicators.get("market_structure", {})
+    ich    = indicators.get("ichimoku")
+    vol    = indicators.get("vol")
+    adx    = indicators.get("adx")
+    rsi    = indicators.get("rsi", 50)
+    div    = indicators.get("divergence", "none")
+    macd   = indicators.get("macd")
+
+    # EMA200 — مهم‌ترین فیلتر برای بلندمدت
+    if ema200:
+        diff_pct = (price - ema200) / ema200 * 100
+        if diff_pct > 5:    v(f"بالای EMA200 ({diff_pct:.1f}%) — روند صعودی قوی", +4)
+        elif diff_pct > 0:  v("کمی بالای EMA200", +2)
+        elif diff_pct > -5: v("کمی زیر EMA200", -2)
+        else:               v(f"زیر EMA200 ({diff_pct:.1f}%) — روند نزولی قوی", -4)
+
+    # EMA Stack (Golden/Death Cross)
+    if ema50 and ema200:
+        if ema50 > ema200: v("Golden Cross — EMA50>EMA200 ✨", +3)
+        else:              v("Death Cross — EMA50<EMA200 💀", -3)
+
+    # Market Structure — برای بلندمدت خیلی مهمه
+    if ms:
+        if ms["bias"] == "bullish":   v(f"ساختار بلندمدت: {ms['structure']}", +4)
+        elif ms["bias"] == "bearish": v(f"ساختار بلندمدت: {ms['structure']}", -4)
+        if ms.get("bos") == "bullish_bos": v("BOS صعودی بلندمدت", +3)
+        elif ms.get("bos") == "bearish_bos": v("BOS نزولی بلندمدت", -3)
+
+    # Ichimoku
+    if ich:
+        if ich["signal"] == "bullish":   v("ایچیموکو بلندمدت صعودی", +3)
+        elif ich["signal"] == "bearish": v("ایچیموکو بلندمدت نزولی", -3)
+
+    # Volume Profile
+    if vol:
+        if vol["ratio"] > 1.5 and vol["trend"] == "bullish": v("حجم بلندمدت صعودی", +2)
+        elif vol["ratio"] > 1.5 and vol["trend"] == "bearish": v("حجم بلندمدت نزولی", -2)
+        elif vol["trend"] == "bullish": v("جریان حجم صعودی", +1)
+        elif vol["trend"] == "bearish": v("جریان حجم نزولی", -1)
+
+    # ADX
+    if adx and adx["adx"] > 25:
+        if adx["+di"] > adx["-di"]: v(f"روند قوی صعودی ADX={adx['adx']:.0f}", +2)
+        else:                        v(f"روند قوی نزولی ADX={adx['adx']:.0f}", -2)
+
+    # Divergence
+    if div == "bullish_divergence":   v("واگرایی مثبت بلندمدت", +4)
+    elif div == "bearish_divergence": v("واگرایی منفی بلندمدت", -4)
+
+    # RSI
+    if   rsi <= 40: v("RSI اشباع فروش بلندمدت", +2)
+    elif rsi >= 60: v("RSI اشباع خرید بلندمدت", -2)
+
+    # MACD
+    if macd:
+        if macd["cross"] == "bullish_cross": v("کراس صعودی MACD هفتگی", +2)
+        elif macd["cross"] == "bearish_cross": v("کراس نزولی MACD هفتگی", -2)
+        elif macd["histogram"] > 0 and macd["macd"] > 0: v("MACD مثبت در ناحیه مثبت", +1)
+        elif macd["histogram"] < 0 and macd["macd"] < 0: v("MACD منفی در ناحیه منفی", -1)
+
+    # POC بلندمدت — تأیید روند با ساختار حجمی
+    poc = indicators.get("poc")
+    if poc:
+        if not poc["in_value_area"] and poc["above_poc"]:
+            v("بالای Value Area — روند صعودی بلندمدت قوی", +3)
+        elif not poc["in_value_area"] and not poc["above_poc"]:
+            v("زیر Value Area — روند نزولی بلندمدت قوی", -3)
+
+    # FVG بلندمدت
+    fvg = indicators.get("fvg")
+    if fvg:
+        sig = fvg.get("signal","none")
+        if sig in ("in_bullish_fvg","near_bullish_fvg"):   v("FVG صعودی بلندمدت — ناحیه انباشت", +2)
+        elif sig in ("in_bearish_fvg","near_bearish_fvg"): v("FVG نزولی بلندمدت — ناحیه توزیع", -2)
+
+    # Order Flow بلندمدت
+    of = indicators.get("order_flow")
+    if of and of["strength"] > 2.0:
+        if of["bias"] == "bullish": v("Order Flow بلندمدت: انباشت نهنگ‌ها 🐋", +3)
+        elif of["bias"] == "bearish": v("Order Flow بلندمدت: توزیع نهنگ‌ها 🐋", -3)
+
+    return votes
+
+SCORE_ENGINES = {
+    "scalp": score_scalp,
+    "short": score_short,
+    "mid":   score_mid,
+    "long":  score_long,
+}
 
 # =========================
 # TIMEFRAME ANALYSIS
 # =========================
-async def analyze_timeframe(symbol, tf, limit):
+async def analyze_timeframe(symbol, tf, limit, mode_key="short"):
     kdata = await get_klines(symbol, tf, limit)
     if not kdata: return None
-
-    closes  = kdata["closes"]; highs   = kdata["highs"]
-    lows    = kdata["lows"];   opens   = kdata["opens"]
-    volumes = kdata["volumes"]; price  = float(closes[-1])
+    closes=kdata["closes"]; highs=kdata["highs"]
+    lows=kdata["lows"];     opens=kdata["opens"]
+    volumes=kdata["volumes"]; price=float(closes[-1])
 
     rsi        = calc_rsi(closes)
     rsi_series = calc_rsi_series(closes)
@@ -819,7 +1132,7 @@ async def analyze_timeframe(symbol, tf, limit):
     bb         = calc_bollinger(closes)
     atr        = calc_atr(highs, lows, closes)
     stoch      = calc_stochastic(highs, lows, closes)
-    vwap       = calc_vwap(highs, lows, closes, volumes)
+    vwap_val   = calc_vwap(highs, lows, closes, volumes)
     sr         = calc_support_resistance(highs, lows, closes)
     adx        = calc_adx(highs, lows, closes)
     ichimoku   = calc_ichimoku(highs, lows, closes)
@@ -827,90 +1140,35 @@ async def analyze_timeframe(symbol, tf, limit):
     vol        = calc_volume_profile(closes, volumes)
     patterns   = detect_candle_patterns(opens, closes, highs, lows)
     ema20      = float(calc_ema(closes, 20)[-1])
-    ema50      = float(calc_ema(closes, 50)[-1]) if len(closes) >= 50  else None
+    ema50      = float(calc_ema(closes, 50)[-1])  if len(closes) >= 50  else None
     ema200     = float(calc_ema(closes, 200)[-1]) if len(closes) >= 200 else None
+    ms         = calc_market_structure(highs, lows, closes) if TRADING_MODES[mode_key].get("use_market_structure") else {}
+    fvg        = calc_fvg(highs, lows, closes)
+    order_flow = calc_order_flow(opens, closes, highs, lows, volumes)
+    poc        = calc_poc(highs, lows, closes, volumes)
 
-    votes = []
-    def v(reason, score): votes.append((reason, score))
+    ind = {
+        "rsi": rsi, "macd": macd, "bb": bb, "atr": atr, "stoch": stoch,
+        "vwap": vwap_val, "sr": sr, "adx": adx, "ichimoku": ichimoku,
+        "divergence": divergence, "vol": vol, "patterns": patterns,
+        "ema20": round(ema20,6),
+        "ema50": round(ema50,6)  if ema50  else None,
+        "ema200": round(ema200,6) if ema200 else None,
+        "market_structure": ms,
+        "fvg":        fvg,
+        "order_flow": order_flow,
+        "poc":        poc,
+    }
 
-    if   rsi <= 30: v("RSI اشباع فروش شدید", +2)
-    elif rsi <= 40: v("RSI نزدیک اشباع فروش", +1)
-    elif rsi >= 70: v("RSI اشباع خرید شدید", -2)
-    elif rsi >= 60: v("RSI نزدیک اشباع خرید", -1)
-    else:           v("RSI خنثی", 0)
-
-    if macd:
-        if   macd["cross"] == "bullish_cross":  v("کراس صعودی MACD", +2)
-        elif macd["cross"] == "bearish_cross":  v("کراس نزولی MACD", -2)
-        elif macd["histogram"] > 0 and macd["prev_hist"] > 0: v("MACD هیستوگرام مثبت", +1)
-        elif macd["histogram"] < 0 and macd["prev_hist"] < 0: v("MACD هیستوگرام منفی", -1)
-        else: v("MACD خنثی", 0)
-
-    if bb:
-        if   bb["bb_pct"] < 10: v("زیر باند پایین بولینگر", +2)
-        elif bb["bb_pct"] < 25: v("نزدیک باند پایین بولینگر", +1)
-        elif bb["bb_pct"] > 90: v("بالای باند بالای بولینگر", -2)
-        elif bb["bb_pct"] > 75: v("نزدیک باند بالای بولینگر", -1)
-        else: v("بولینگر خنثی", 0)
-
-    if stoch:
-        if   stoch["k"] < 20 and stoch["cross"] == "bullish": v("کراس صعودی استوک در اشباع فروش", +2)
-        elif stoch["k"] < 20: v("استوکستیک اشباع فروش", +1)
-        elif stoch["k"] > 80 and stoch["cross"] == "bearish": v("کراس نزولی استوک در اشباع خرید", -2)
-        elif stoch["k"] > 80: v("استوکستیک اشباع خرید", -1)
-        else: v("استوکستیک خنثی", 0)
-
-    if adx:
-        if adx["trend"] in ("strong", "moderate"):
-            w2 = 2 if adx["trend"] == "strong" else 1
-            v("ADX روند صعودی قوی", +w2) if adx["+di"] > adx["-di"] else v("ADX روند نزولی قوی", -w2)
-        else: v("ADX بازار رنج", 0)
-
-    if   price > vwap * 1.002: v("قیمت بالای VWAP", +1)
-    elif price < vwap * 0.998: v("قیمت زیر VWAP", -1)
-    else: v("قیمت روی VWAP", 0)
-
-    if ema50:
-        if   ema20 > ema50 and price > ema20:  v("قیمت بالای EMA20>EMA50", +2)
-        elif ema20 < ema50 and price < ema20:  v("قیمت زیر EMA20<EMA50", -2)
-        elif price > ema20: v("قیمت بالای EMA20", +1)
-        elif price < ema20: v("قیمت زیر EMA20", -1)
-        else: v("EMA خنثی", 0)
-    if ema200:
-        v("بالای EMA200", +1) if price > ema200 else v("زیر EMA200", -1)
-
-    if ichimoku:
-        if   ichimoku["signal"] == "bullish": v("ایچیموکو صعودی", +2)
-        elif ichimoku["signal"] == "bearish": v("ایچیموکو نزولی", -2)
-        else: v("ایچیموکو خنثی", 0)
-
-    if   divergence == "bullish_divergence": v("واگرایی مثبت RSI", +3)
-    elif divergence == "bearish_divergence": v("واگرایی منفی RSI", -3)
-
-    if vol["ratio"] > 1.5:
-        if   vol["trend"] == "bullish": v("حجم صعودی بالا", +2)
-        elif vol["trend"] == "bearish": v("حجم نزولی بالا", -2)
-        else: v("حجم بالا بی‌جهت", 0)
-    else: v("حجم معمولی", 0)
-
-    dist_sup = abs(price - sr["near_support"])    / price * 100
-    dist_res = abs(price - sr["near_resistance"]) / price * 100
-    if   dist_sup < 1.0: v("نزدیک حمایت قوی", +2)
-    elif dist_res < 1.0: v("نزدیک مقاومت قوی", -2)
-    else: v("بین حمایت و مقاومت", 0)
+    # از موتور مناسب استفاده کن
+    engine = SCORE_ENGINES.get(mode_key, score_short)
+    votes  = engine(ind, price)
 
     return {
-        "tf":    tf,
+        "tf": tf,
         "votes": votes,
         "score": sum(sc for _, sc in votes),
-        "indicators": {
-            "rsi": rsi, "macd": macd, "bb": bb, "atr": atr, "stoch": stoch,
-            "vwap": vwap, "sr": sr, "adx": adx, "ichimoku": ichimoku,
-            "divergence": divergence, "vol": vol, "patterns": patterns,
-            "ema20":  round(ema20, 6),
-            "ema50":  round(ema50, 6)  if ema50  else None,
-            "ema200": round(ema200, 6) if ema200 else None,
-        }
+        "indicators": ind
     }
 
 # =========================
@@ -923,12 +1181,10 @@ async def full_analysis(symbol, mode_key="short"):
     mode  = TRADING_MODES[mode_key]
     price = ticker["price"]
 
-    tasks       = [analyze_timeframe(symbol, tf, mode["kline_limit"]) for tf in mode["timeframes"]]
+    tasks = [analyze_timeframe(symbol, tf, mode["kline_limit"], mode_key) for tf in mode["timeframes"]]
     raw_results = await asyncio.gather(*tasks)
 
-    tf_results  = {}
-    total_score = 0
-    all_reasons = []
+    tf_results = {}; total_score = 0; all_reasons = []
 
     for tf, result in zip(mode["timeframes"], raw_results):
         if not result: continue
@@ -942,73 +1198,304 @@ async def full_analysis(symbol, mode_key="short"):
     tf_dirs = []
     for tf, result in tf_results.items():
         s = result["score"]
-        tf_dirs.append(+1 if s > 2 else (-1 if s < -2 else 0))
+        tf_dirs.append(+1 if s > 1 else (-1 if s < -1 else 0))
 
-    bullish_c = tf_dirs.count(+1)
-    bearish_c = tf_dirs.count(-1)
+    bullish_c = tf_dirs.count(+1); bearish_c = tf_dirs.count(-1)
     total_tfs = len(tf_dirs)
-    agreement = max(bullish_c, bearish_c) / total_tfs if total_tfs > 0 else 0
+    agreement = max(bullish_c, bearish_c)/total_tfs if total_tfs > 0 else 0
 
     main_tf     = mode["timeframes"][1] if len(mode["timeframes"]) > 1 else mode["timeframes"][0]
     main_result = tf_results.get(main_tf, {})
     adx_info    = main_result.get("indicators", {}).get("adx", {}) if main_result else {}
     is_ranging  = bool(adx_info and adx_info.get("trend") == "weak")
 
-    threshold  = mode["signal_threshold"]
-    min_agree  = mode["min_agreement"]
-    hold_hours = mode["hold_hours"]
-
-    direction  = "NEUTRAL ⚪"
-    confidence = "سیگنال ضعیف ⚠️"
+    threshold = mode["signal_threshold"]; min_agree = mode["min_agreement"]
+    direction = "NEUTRAL ⚪"; confidence = "سیگنال ضعیف ⚠️"
     sl = tp1 = tp2 = tp3 = None; expiry = None
 
-    if total_score >= threshold and agreement >= min_agree and not is_ranging:
+    # برای اسکالپ، تأیید حجم اجباریه
+    volume_ok = True
+    if mode.get("require_volume_confirm"):
+        main_vol = main_result.get("indicators", {}).get("vol", {}) if main_result else {}
+        if main_vol.get("ratio", 1.0) < 1.0: volume_ok = False
+
+    if total_score >= threshold and agreement >= min_agree and not is_ranging and volume_ok:
         direction = "LONG 🟢"
-    elif total_score <= -threshold and agreement >= min_agree and not is_ranging:
+    elif total_score <= -threshold and agreement >= min_agree and not is_ranging and volume_ok:
         direction = "SHORT 🔴"
 
     if direction != "NEUTRAL ⚪":
         main_ind = main_result.get("indicators", {}) if main_result else {}
-        atr_v    = main_ind.get("atr", price * 0.01)
-        sr_v     = main_ind.get("sr", {"near_support": price * 0.97, "near_resistance": price * 1.03})
+        atr_v    = main_ind.get("atr", price*0.01)
+        sr_v     = main_ind.get("sr", {"near_support": price*0.97, "near_resistance": price*1.03})
 
-        strength  = abs(total_score) / (threshold * 2)
         agree_pct = agreement * 100
+        strength  = abs(total_score) / (threshold * 2)
 
         if agree_pct >= 85 and strength >= 1.0:
-            confidence = "خیلی بالا 🔥🔥"; sl_m = 1.2; tp_m = [1.5, 3.0]
+            confidence = "خیلی بالا 🔥🔥"
+            sl_m = mode["sl_atr_mult"] * 0.9
+            tp_m = [mode["tp_atr_mults"][0]*0.9, mode["tp_atr_mults"][1]]
         elif agree_pct >= 75:
-            confidence = "بالا 🔥";          sl_m = 1.5; tp_m = [2.0, 4.0]
+            confidence = "بالا 🔥"
+            sl_m = mode["sl_atr_mult"]
+            tp_m = mode["tp_atr_mults"]
         else:
-            confidence = "متوسط ✅";         sl_m = 2.0; tp_m = [2.5, 5.0]
+            confidence = "متوسط ✅"
+            sl_m = mode["sl_atr_mult"] * 1.2
+            tp_m = [mode["tp_atr_mults"][0]*1.1, mode["tp_atr_mults"][1]*1.2]
 
         if direction == "LONG 🟢":
-            sl  = round(max(price - atr_v * sl_m, sr_v["near_support"] * 0.997), 6)
-            tp1 = round(price + atr_v * tp_m[0], 6)
-            tp2 = round(price + atr_v * tp_m[1], 6)
-            tp3 = round(min(sr_v["near_resistance"] * 0.998, tp2 * 1.05), 6)
+            sl  = round(max(price - atr_v*sl_m, sr_v["near_support"]*0.997), 6)
+            tp1 = round(price + atr_v*tp_m[0], 6)
+            tp2 = round(price + atr_v*tp_m[1], 6)
+            tp3 = round(min(sr_v["near_resistance"]*0.998, tp2*1.05), 6)
         else:
-            sl  = round(min(price + atr_v * sl_m, sr_v["near_resistance"] * 1.003), 6)
-            tp1 = round(price - atr_v * tp_m[0], 6)
-            tp2 = round(price - atr_v * tp_m[1], 6)
-            tp3 = round(max(sr_v["near_support"] * 1.002, tp2 * 0.95), 6)
+            sl  = round(min(price + atr_v*sl_m, sr_v["near_resistance"]*1.003), 6)
+            tp1 = round(price - atr_v*tp_m[0], 6)
+            tp2 = round(price - atr_v*tp_m[1], 6)
+            tp3 = round(max(sr_v["near_support"]*1.002, tp2*0.95), 6)
 
-        expiry = (datetime.now() + timedelta(hours=hold_hours)).isoformat()
+        expiry = (datetime.now() + timedelta(hours=mode["hold_hours"])).isoformat()
 
     return {
         "symbol": symbol, "mode": mode_key, "mode_label": mode["label"],
         "price": price, "ticker": ticker,
         "direction": direction, "score": total_score,
-        "confidence": confidence, "agreement": round(agreement * 100, 1),
+        "confidence": confidence, "agreement": round(agreement*100, 1),
         "entry": price, "stop_loss": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-        "hold_label": mode["hold_label"], "hold_hours": hold_hours, "expiry": expiry,
+        "hold_label": mode["hold_label"], "hold_hours": mode["hold_hours"], "expiry": expiry,
         "reasons": all_reasons[:8], "timeframes": tf_results,
         "is_ranging": is_ranging,
+        "volume_ok": volume_ok,
         "tf_agreement": {"bullish": bullish_c, "bearish": bearish_c, "neutral": tf_dirs.count(0)},
     }
 
 # =========================
-# MESSAGE BUILDERS
+# BACKTEST ساده
+# =========================
+async def run_backtest(symbol, mode_key="short", periods=20):
+    """
+    بک‌تست ساده: سیگنال‌های گذشته رو شبیه‌سازی می‌کنیم
+    با داده‌های تاریخی از API
+    """
+    mode    = TRADING_MODES[mode_key]
+    main_tf = mode["timeframes"][1] if len(mode["timeframes"]) > 1 else mode["timeframes"][0]
+    limit   = mode["kline_limit"] + periods
+
+    kdata = await get_klines(symbol, main_tf, limit)
+    if not kdata or len(kdata["closes"]) < 60: return None
+
+    closes  = kdata["closes"]; highs   = kdata["highs"]
+    lows    = kdata["lows"];   opens   = kdata["opens"]
+    volumes = kdata["volumes"]
+
+    results = []
+    step    = max(1, len(closes) // periods)
+
+    for i in range(50, len(closes) - 5, step):
+        c = closes[:i]; h = highs[:i]; l = lows[:i]; o = opens[:i]; v = volumes[:i]
+        price = float(c[-1])
+
+        rsi      = calc_rsi(c)
+        rsi_ser  = calc_rsi_series(c)
+        macd     = calc_macd(c)
+        bb       = calc_bollinger(c)
+        atr      = calc_atr(h, l, c)
+        stoch    = calc_stochastic(h, l, c)
+        vwap_v   = calc_vwap(h, l, c, v)
+        adx      = calc_adx(h, l, c)
+        div      = detect_divergence(c, rsi_ser)
+        vol      = calc_volume_profile(c, v)
+        fvg      = calc_fvg(h, l, c)
+        of_data  = calc_order_flow(o, c, h, l, v)
+        poc_data = calc_poc(h, l, c, v)
+        ema20    = float(calc_ema(c, 20)[-1])
+        ema50    = float(calc_ema(c, 50)[-1]) if len(c)>=50 else None
+
+        ind = {"rsi":rsi,"macd":macd,"bb":bb,"atr":atr,"stoch":stoch,"vwap":vwap_v,
+               "adx":adx,"divergence":div,"vol":vol,"fvg":fvg,"order_flow":of_data,
+               "poc":poc_data,"ema20":ema20,"ema50":ema50,"ema200":None,
+               "ichimoku":None,"market_structure":{},"sr":None,"patterns":[]}
+
+        engine = SCORE_ENGINES.get(mode_key, score_short)
+        votes  = engine(ind, price)
+        score  = sum(s for _, s in votes)
+        threshold = mode["signal_threshold"]
+
+        if abs(score) < threshold: continue
+        direction = "LONG" if score >= threshold else "SHORT"
+
+        # بررسی ۵ کندل بعد
+        future_closes = closes[i:i+5]
+        if len(future_closes) < 3: continue
+        future_max = float(np.max(future_closes))
+        future_min = float(np.min(future_closes))
+        atr_v      = float(atr)
+
+        if direction == "LONG":
+            sl_p  = price - atr_v * mode["sl_atr_mult"]
+            tp1_p = price + atr_v * mode["tp_atr_mults"][0]
+            hit_tp = future_max >= tp1_p
+            hit_sl = future_min <= sl_p
+        else:
+            sl_p  = price + atr_v * mode["sl_atr_mult"]
+            tp1_p = price - atr_v * mode["tp_atr_mults"][0]
+            hit_tp = future_min <= tp1_p
+            hit_sl = future_max >= sl_p
+
+        if hit_tp and not hit_sl: outcome = "win"
+        elif hit_sl:               outcome = "loss"
+        else:
+            last_price = float(future_closes[-1])
+            pnl = (last_price-price)/price*100 if direction=="LONG" else (price-last_price)/price*100
+            outcome = "partial_win" if pnl > 0 else "partial_loss"
+
+        results.append({"direction": direction, "score": score, "outcome": outcome, "price": round(price,4)})
+
+    if not results: return None
+    wins    = sum(1 for r in results if r["outcome"]=="win")
+    losses  = sum(1 for r in results if r["outcome"]=="loss")
+    partial = sum(1 for r in results if "partial" in r["outcome"])
+    total   = len(results)
+    wr      = round(wins/total*100, 1) if total > 0 else 0
+
+    return {"symbol": symbol, "mode": mode_key, "total": total,
+            "wins": wins, "losses": losses, "partial": partial,
+            "win_rate": wr, "results": results[-10:]}
+
+# =========================
+# LEVERAGE ENGINE
+# =========================
+def calc_leverage(signal_score, agreement_pct, mode_key, confidence_label, atr_pct):
+    base = {"scalp":8,"short":4,"mid":3,"long":2}.get(mode_key, 2)
+    af   = 1.4 if agreement_pct>=85 else (1.2 if agreement_pct>=78 else (1.0 if agreement_pct>=70 else 0.6))
+    cf   = {"خیلی بالا 🔥🔥":1.3,"بالا 🔥":1.1,"متوسط ✅":0.9}.get(confidence_label, 1.0)
+    vf   = 0.5 if atr_pct>=3.0 else (0.7 if atr_pct>=2.0 else (0.9 if atr_pct>=1.0 else 1.1))
+    return max(1, min(10, round(base*af*cf*vf)))
+
+def build_leverage_section(analysis, capital):
+    if analysis["direction"] == "NEUTRAL ⚪" or not analysis["stop_loss"]: return ""
+    entry=analysis["entry"]; sl=analysis["stop_loss"]
+    tp1=analysis["tp1"];     tp2=analysis["tp2"]
+    sl_pct  = abs(entry-sl)/entry*100
+    tp1_pct = abs(tp1-entry)/entry*100 if tp1 else 0
+    tp2_pct = abs(tp2-entry)/entry*100 if tp2 else 0
+    atr_pct = sl_pct/1.5
+    leverage = calc_leverage(analysis["score"], analysis["agreement"], analysis["mode"], analysis["confidence"], atr_pct)
+    tp1_l = round(tp1_pct*leverage,2); tp2_l = round(tp2_pct*leverage,2); sl_l = round(sl_pct*leverage,2)
+    capital_line = ""
+    if capital:
+        pos = capital*0.20
+        capital_line = (f"💵 با ۲۰٪ سرمایه (${pos:,.0f}):\n"
+                        f"  سود TP1: +${round(pos*(tp1_l/100),2):,.1f}  |  TP2: +${round(pos*(tp2_l/100),2):,.1f}\n"
+                        f"  زیان SL: -${round(pos*(sl_l/100),2):,.1f}\n")
+    lev_emoji = "🟢" if leverage<=2 else ("🟡" if leverage<=5 else "🔴")
+    lev_note  = "محافظه‌کارانه" if leverage<=2 else ("متعادل" if leverage<=5 else "ریسک بالا — فقط با SL")
+    msg  = f"\n⚡ اهرم پیشنهادی:\n━━━━━━━━━━━━━━━\n"
+    msg += f"{lev_emoji} اهرم: {leverage}x  ({lev_note})\n\n"
+    msg += f"📊 سود/زیان با {leverage}x:\n"
+    msg += f"  بدون اهرم → TP1: +{tp1_pct:.2f}%  |  SL: -{sl_pct:.2f}%\n"
+    msg += f"  با اهرم   → TP1: +{tp1_l}%  |  SL: -{sl_l}%\n"
+    if tp2: msg += f"  با اهرم   → TP2: +{tp2_l}%\n"
+    if capital_line: msg += f"\n{capital_line}"
+    msg += f"\n⚠️ اهرم سود و زیان رو هر دو چندبرابر می‌کنه\n📌 بدون SL وارد نشو!\n"
+    return msg
+
+# =========================
+# MONEY MANAGEMENT
+# =========================
+def calc_position_size(capital, entry, stop_loss, mode_key, agreement_pct):
+    mode = TRADING_MODES[mode_key]
+    base_risk = mode["risk_pct"]
+    af = 1.3 if agreement_pct>=85 else (1.15 if agreement_pct>=78 else (1.0 if agreement_pct>=70 else 0.7))
+    adj_risk = min(base_risk*af, 5.0)
+    risk_usd = capital*(adj_risk/100)
+    sl_pct   = abs(entry-stop_loss)/entry*100 if stop_loss else 1.0
+    if sl_pct <= 0: sl_pct = 1.0
+    pos_size = risk_usd/(sl_pct/100)
+    pos_pct  = min(pos_size/capital*100, 50.0)
+    coin_amt = pos_size/entry if entry > 0 else 0
+    return {"risk_pct": round(adj_risk,2), "risk_amount": round(risk_usd,2),
+            "position_pct": round(pos_pct,2), "position_size_usd": round(pos_size,2),
+            "coin_amount": round(coin_amt,6), "sl_distance_pct": round(sl_pct,2)}
+
+def build_mm_section(capital, analysis):
+    if not capital or analysis["direction"] == "NEUTRAL ⚪" or not analysis["stop_loss"]: return ""
+    mm   = calc_position_size(capital, analysis["entry"], analysis["stop_loss"], analysis["mode"], analysis["agreement"])
+    tp1_pct = abs(analysis["tp1"]-analysis["entry"])/analysis["entry"]*100 if analysis["tp1"] else 0
+    rr   = round(tp1_pct/mm["sl_distance_pct"],2) if mm["sl_distance_pct"] > 0 else 0
+    msg  = f"\n💼 مدیریت سرمایه:\n━━━━━━━━━━━━━━━\n"
+    msg += f"💰 سرمایه کل:        ${capital:,.0f}\n"
+    msg += f"📊 حجم پیشنهادی:     {mm['position_pct']}٪  ≈ ${mm['position_size_usd']:,.0f}\n"
+    msg += f"🎲 ریسک این معامله:  {mm['risk_pct']}٪  ≈ ${mm['risk_amount']:,.0f}\n"
+    msg += f"📏 فاصله استاپ:      {mm['sl_distance_pct']}٪\n"
+    msg += f"🪙 مقدار خرید:       {mm['coin_amount']} واحد\n"
+    msg += f"⚖️ نسبت R/R:         1:{rr}\n"
+    if rr >= 2:     msg += f"  ✅ R/R مناسب\n"
+    elif rr >= 1.5: msg += f"  🟡 R/R قابل قبول\n"
+    else:           msg += f"  ⚠️ R/R پایین — احتیاط\n"
+    return msg
+
+# =========================
+# DATA
+# =========================
+def load_data():
+    global user_data
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE,"r",encoding="utf-8") as f: user_data = json.load(f)
+        except Exception as e: log.error(f"Load error: {e}"); user_data = {}
+
+def save_data():
+    try:
+        tmp = DATA_FILE+".tmp"
+        with open(tmp,"w",encoding="utf-8") as f: json.dump(user_data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, DATA_FILE)
+    except Exception as e: log.error(f"Save error: {e}")
+
+def backup_data():
+    try:
+        with open(DATA_FILE+".bak","w",encoding="utf-8") as f: json.dump(user_data, f, ensure_ascii=False, indent=2)
+    except Exception as e: log.error(f"Backup error: {e}")
+
+def load_users_list():
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE,"r",encoding="utf-8") as f: return json.load(f)
+        except: pass
+    return {}
+
+def save_users_list(ul):
+    try:
+        with open(USERS_FILE,"w",encoding="utf-8") as f: json.dump(ul, f, ensure_ascii=False, indent=2)
+    except Exception as e: log.error(f"Save users: {e}")
+
+def register_user(update):
+    user=update.effective_user; chat_id=str(update.effective_chat.id)
+    ul=load_users_list(); is_new=chat_id not in ul
+    ul[chat_id] = {"chat_id":chat_id,"first_name":user.first_name or "",
+                   "last_name":user.last_name or "","username":f"@{user.username}" if user.username else "ندارد",
+                   "first_seen":ul.get(chat_id,{}).get("first_seen",datetime.now().isoformat()),
+                   "last_seen":datetime.now().isoformat(),
+                   "count":ul.get(chat_id,{}).get("count",0)+1}
+    save_users_list(ul); return is_new, ul[chat_id]
+
+def init_user(chat_id):
+    if chat_id not in user_data:
+        user_data[chat_id] = {
+            "symbols": ["BTCUSDT","ETHUSDT","SOLUSDT"],
+            "interval": 60, "active": True, "trading_mode": "short",
+            "capital": None, "active_positions": {}, "signal_history": [],
+            "signal_stats": {"total":0,"win":0,"loss":0,"neutral_exit":0},
+            "price_alerts": {},
+            "auto_alert_threshold": 8,  # امتیاز حداقل برای آلرت خودکار
+            "auto_alert_enabled": True,
+        }
+        save_data()
+
+# =========================
+# FORMAT HELPERS
 # =========================
 def format_price(p):
     if p is None: return "N/A"
@@ -1016,7 +1503,10 @@ def format_price(p):
     if p >= 1:    return f"{p:,.4f}"
     return f"{p:,.6f}"
 
-def build_analysis_message(a, capital=None):
+# =========================
+# MESSAGE BUILDERS
+# =========================
+def build_analysis_message(a, capital=None, fg=None, fr=None, whale=None):
     if not a: return "❌ خطا در دریافت داده"
     sym = a["symbol"]
     tv  = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}"
@@ -1028,19 +1518,40 @@ def build_analysis_message(a, capital=None):
     msg += f"━━━━━━━━━━━━━━━━━━━━\n\n"
     msg += f"💵 قیمت: {format_price(a['price'])} USDT\n"
     msg += f"📈 تغییر ۲۴h: {a['ticker']['change']:+.2f}%\n"
-    msg += f"🕐 بازه: {a['mode_label']}\n\n"
-    msg += f"🎯 سیگنال: {a['direction']}\n"
+    msg += f"🕐 بازه: {a['mode_label']}\n"
+
+    if fg:
+        msg += f"😱 Fear&Greed: {fg['value']} — {fg['label']} {fg['emoji']}\n"
+    if fr:
+        fr_emoji = "🟢" if fr["bullish"] else "🔴"
+        fr_warn  = " ⚠️ افراطی!" if fr["extreme"] else ""
+        msg += f"{fr_emoji} Funding Rate: {fr['rate']}%{fr_warn}\n"
+    if whale and whale.get("alert"):
+        msg += f"🐋 Whale Alert: {whale.get('large_tx',0)} تراکنش بزرگ!\n"
+
+    msg += f"\n🎯 سیگنال: {a['direction']}\n"
     msg += f"💪 اطمینان: {a['confidence']}\n"
     msg += f"📐 امتیاز: {a['score']}  |  هم‌راستایی: {a['agreement']}%\n"
     msg += f"📊 تأیید TF: ✅{agg['bullish']} صعودی | ❌{agg['bearish']} نزولی | ⚪{agg['neutral']} خنثی\n"
 
     if a.get("is_ranging"):
-        msg += f"\n⚠️ بازار رنج — از معامله خودداری کن\n"
+        msg += f"\n⚠️ بازار رنج — از ورود خودداری کن\n"
+    if not a.get("volume_ok", True):
+        msg += f"\n⚠️ حجم ضعیف — سیگنال تأیید نشد\n"
+
+    # Market Structure (برای mid و long)
+    main_tf = TRADING_MODES[a["mode"]]["timeframes"][1] if len(TRADING_MODES[a["mode"]]["timeframes"])>1 else TRADING_MODES[a["mode"]]["timeframes"][0]
+    main_ms = a["timeframes"].get(main_tf,{}).get("indicators",{}).get("market_structure",{}) if main_tf in a["timeframes"] else {}
+    if main_ms and main_ms.get("structure") and main_ms["structure"] != "unknown":
+        msg += f"🏗 ساختار: {main_ms['structure']}"
+        if main_ms.get("bos") != "none":
+            msg += f" | BOS: {'↑' if main_ms['bos']=='bullish_bos' else '↓'}"
+        msg += "\n"
 
     if a["direction"] != "NEUTRAL ⚪" and a["stop_loss"]:
-        sl_pct  = abs(a["entry"] - a["stop_loss"]) / a["entry"] * 100
-        tp1_pct = abs(a["tp1"] - a["entry"]) / a["entry"] * 100 if a["tp1"] else 0
-        rr      = round(tp1_pct / sl_pct, 2) if sl_pct > 0 else 0
+        sl_pct  = abs(a["entry"]-a["stop_loss"])/a["entry"]*100
+        tp1_pct = abs(a["tp1"]-a["entry"])/a["entry"]*100 if a["tp1"] else 0
+        rr      = round(tp1_pct/sl_pct, 2) if sl_pct > 0 else 0
 
         msg += f"\n🔰 ورود:      {format_price(a['entry'])}\n"
         msg += f"🛑 Stop Loss: {format_price(a['stop_loss'])}  ({sl_pct:.2f}%)\n"
@@ -1057,205 +1568,286 @@ def build_analysis_message(a, capital=None):
 
     if a["reasons"]:
         msg += f"\n📋 دلایل اصلی:\n"
-        for r in a["reasons"]:
-            msg += f"  • {r}\n"
+        for r in a["reasons"]: msg += f"  • {r}\n"
 
-    mode    = TRADING_MODES.get(a["mode"], {})
-    tfs     = mode.get("timeframes", [])
-    main_tf = tfs[1] if len(tfs) > 1 else (tfs[0] if tfs else None)
-    ind     = a["timeframes"].get(main_tf, {}).get("indicators", {}) if main_tf else {}
-
+    ind = a["timeframes"].get(main_tf,{}).get("indicators",{}) if main_tf in a["timeframes"] else {}
     if ind:
-        stoch_v = ind.get("stoch") or {}
-        macd_v  = ind.get("macd")  or {}
-        adx_v   = ind.get("adx")   or {}
-        bb_v    = ind.get("bb")    or {}
-        ich     = ind.get("ichimoku") or {}
-        div     = ind.get("divergence", "none")
-        pats    = ind.get("patterns", [])
+        stoch_v=ind.get("stoch") or {}; macd_v=ind.get("macd") or {}
+        adx_v=ind.get("adx") or {};     bb_v=ind.get("bb") or {}
+        ich=ind.get("ichimoku") or {};  div=ind.get("divergence","none")
+        pats=ind.get("patterns",[])
         msg += f"\n📉 اندیکاتور ({main_tf}):\n"
         msg += f"  RSI: {ind.get('rsi','N/A')}  |  Stoch K/D: {stoch_v.get('k','N/A')}/{stoch_v.get('d','N/A')}\n"
-        msg += f"  MACD: {macd_v.get('macd','N/A')}  |  ADX: {adx_v.get('adx','N/A')} ({adx_v.get('trend','N/A')})\n"
-        if bb_v:
-            msg += f"  BB%: {bb_v.get('bb_pct','N/A')}  |  Bandwidth: {bb_v.get('bandwidth','N/A')}\n"
-        if ich:
-            msg += f"  Ichimoku: {ich['signal']}\n"
-        if div != "none":
-            msg += f"  ⚡ {div}\n"
-        if pats:
-            msg += f"  الگو: {', '.join(pats[:2])}\n"
+        msg += f"  MACD Hist: {macd_v.get('histogram','N/A')}  |  ADX: {adx_v.get('adx','N/A')} ({adx_v.get('trend','N/A')})\n"
+        if bb_v: msg += f"  BB%: {bb_v.get('bb_pct','N/A')}  |  BW: {bb_v.get('bandwidth','N/A')}\n"
+        if ich:  msg += f"  Ichimoku: {ich.get('signal','N/A')} | TK Cross: {ich.get('tk_cross','N/A')}\n"
+        if div != "none": msg += f"  ⚡ {div}\n"
+        if pats: msg += f"  الگو: {', '.join(pats[:2])}\n"
+        if ind.get("ema200"): msg += f"  EMA200: {format_price(ind['ema200'])}\n"
 
-    msg += f"\n🔗 {tv}\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━"
+        # FVG
+        fvg_d = ind.get("fvg")
+        if fvg_d and fvg_d.get("signal","none") != "none":
+            fvg_emoji = "🟢" if "bullish" in fvg_d["signal"] else "🔴"
+            msg += f"  {fvg_emoji} FVG: {fvg_d['signal']} (فاصله: {fvg_d.get('nearest_dist','?')}%)\n"
+
+        # POC
+        poc_d = ind.get("poc")
+        if poc_d:
+            poc_pos = "بالای POC ✅" if poc_d["above_poc"] else "زیر POC ⚠️"
+            msg += f"  💹 POC: {format_price(poc_d['poc'])} | {poc_pos} | VA: {'داخل' if poc_d['in_value_area'] else 'خارج'}\n"
+
+        # Order Flow
+        of_d = ind.get("order_flow")
+        if of_d and of_d.get("imbalance") in ("strong_bullish","strong_bearish"):
+            of_emoji = "🟢" if of_d["bias"]=="bullish" else "🔴"
+            msg += f"  {of_emoji} Order Flow: {of_d['imbalance']} (قدرت: {of_d['strength']}x)\n"
+
+    msg += f"\n🔗 {tv}\n━━━━━━━━━━━━━━━━━━━━"
     return msg
 
 def build_price_message(symbol, ticker):
     if not ticker: return f"❌ ارز {symbol} یافت نشد"
-    now   = datetime.now().strftime("%H:%M:%S")
-    emoji = "📈" if ticker["change"] >= 0 else "📉"
-    msg  = f"💰 قیمت لحظه‌ای\n"
-    msg += f"━━━━━━━━━━━━━━\n"
+    now=datetime.now().strftime("%H:%M:%S"); emoji="📈" if ticker["change"]>=0 else "📉"
+    msg  = f"💰 قیمت لحظه‌ای\n━━━━━━━━━━━━━━\n"
     msg += f"🪙 {symbol}\n"
     msg += f"💵 قیمت:     {format_price(ticker['price'])} USDT\n"
     msg += f"{emoji} تغییر ۲۴h: {ticker['change']:+.2f}%\n"
     msg += f"🔼 بیشترین:  {format_price(ticker['high'])}\n"
     msg += f"🔽 کمترین:   {format_price(ticker['low'])}\n"
-    msg += f"📦 حجم:      {ticker['volume']:,.0f}\n"
-    msg += f"⏰ {now}"
+    msg += f"📦 حجم:      {ticker['volume']:,.0f}\n⏰ {now}"
     return msg
 
 def build_history_message(history, stats):
     if not history: return "📭 هنوز هیچ سیگنالی ثبت نشده"
-    total = stats["total"]; win = stats["win"]; loss = stats["loss"]
-    ne    = stats.get("neutral_exit", 0)
-    wr    = round(win / total * 100, 1) if total > 0 else 0
-    msg  = f"📊 تاریخچه سیگنال‌ها\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+    total=stats["total"]; win=stats["win"]; loss=stats["loss"]; ne=stats.get("neutral_exit",0)
+    wr=round(win/total*100,1) if total > 0 else 0
+    msg  = f"📊 تاریخچه سیگنال‌ها\n━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"کل: {total} | ✅موفق: {win} | ❌ناموفق: {loss} | 🟡خنثی: {ne}\n"
-    msg += f"نرخ موفقیت: {wr}%\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━\n\n"
+    msg += f"نرخ موفقیت: {wr}%\n━━━━━━━━━━━━━━━━━━━━\n\n"
     for s in reversed(history[-10:]):
-        t   = datetime.fromisoformat(s["time"]).strftime("%m/%d %H:%M")
-        res = s.get("result", "در انتظار")
+        t=datetime.fromisoformat(s["time"]).strftime("%m/%d %H:%M"); res=s.get("result","در انتظار")
         msg += f"• {s['symbol']} | {s['direction']}\n"
         msg += f"  ورود: {format_price(s['entry'])} | نتیجه: {res} | {t}\n\n"
+    return msg
+
+def build_performance_report(chat_id):
+    """گزارش عملکرد جامع"""
+    stats   = user_data.get(chat_id, {}).get("signal_stats", {})
+    history = user_data.get(chat_id, {}).get("signal_history", [])
+    total   = stats.get("total", 0)
+    if total == 0: return "📭 هنوز سیگنالی ثبت نشده"
+
+    win  = stats.get("win", 0); loss = stats.get("loss", 0); ne = stats.get("neutral_exit", 0)
+    wr   = round(win/total*100, 1) if total > 0 else 0
+
+    # آمار بر اساس مود
+    mode_stats = {}
+    for h in history:
+        m = h.get("mode", "short")
+        if m not in mode_stats: mode_stats[m] = {"total":0,"win":0,"loss":0}
+        mode_stats[m]["total"] += 1
+        res = h.get("result", "")
+        if "موفق" in res: mode_stats[m]["win"] += 1
+        elif "استاپ" in res: mode_stats[m]["loss"] += 1
+
+    msg  = f"📈 گزارش عملکرد ربات\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    msg += f"📊 کلی:\n"
+    msg += f"  کل سیگنال:   {total}\n"
+    msg += f"  ✅ موفق:     {win} ({wr}%)\n"
+    msg += f"  ❌ ناموفق:   {loss} ({round(loss/total*100,1) if total else 0}%)\n"
+    msg += f"  🟡 خنثی:     {ne}\n\n"
+    msg += f"📊 بر اساس بازه:\n"
+    for mk, ms in mode_stats.items():
+        mwr = round(ms["win"]/ms["total"]*100, 0) if ms["total"] > 0 else 0
+        label = TRADING_MODES.get(mk, {}).get("label", mk)
+        msg += f"  {label}: {ms['total']} سیگنال | ✅{mwr}%\n"
+
+    # آخرین ۵ سیگنال
+    if history:
+        msg += f"\n📋 آخرین ۵ سیگنال:\n"
+        for h in reversed(history[-5:]):
+            t = datetime.fromisoformat(h["time"]).strftime("%m/%d %H:%M")
+            pnl = f" ({h['pnl_pct']:+.1f}%)" if h.get("pnl_pct") else ""
+            msg += f"  • {h['symbol']} {h['direction']} | {h.get('result','در انتظار')}{pnl} | {t}\n"
+
     return msg
 
 # =========================
 # MENUS
 # =========================
 def main_menu(chat_id):
-    ud        = user_data.get(chat_id, {})
-    is_active = ud.get("active", True)
-    symbols   = ud.get("symbols", [])
-    mode_key  = ud.get("trading_mode", "short")
-    capital   = ud.get("capital")
-    cap_text  = f"${capital:,.0f}" if capital else "تنظیم نشده ⚠️"
-    toggle_btn = (
-        InlineKeyboardButton("⏹ توقف ارسال",  callback_data="toggle_off")
-        if is_active else
-        InlineKeyboardButton("▶️ شروع ارسال", callback_data="toggle_on")
-    )
+    ud = user_data.get(chat_id, {}); is_active = ud.get("active", True)
+    symbols = ud.get("symbols", []); mode_key = ud.get("trading_mode", "short")
+    capital = ud.get("capital"); cap_text = f"${capital:,.0f}" if capital else "تنظیم نشده ⚠️"
+    auto_alert = ud.get("auto_alert_enabled", True)
+    toggle_btn = (InlineKeyboardButton("⏹ توقف ارسال", callback_data="toggle_off")
+                  if is_active else InlineKeyboardButton("▶️ شروع ارسال", callback_data="toggle_on"))
+    alert_btn = (InlineKeyboardButton("🔕 آلرت خودکار: روشن", callback_data="toggle_autoalert")
+                 if auto_alert else InlineKeyboardButton("🔔 آلرت خودکار: خاموش", callback_data="toggle_autoalert"))
     keyboard = [
-        [InlineKeyboardButton("📊 تحلیل همین الان",    callback_data="do_analysis")],
-        [InlineKeyboardButton("💰 قیمت لحظه‌ای",       callback_data="menu_price")],
+        [InlineKeyboardButton("📊 تحلیل همین الان", callback_data="do_analysis")],
+        [InlineKeyboardButton("💰 قیمت لحظه‌ای", callback_data="menu_price")],
         [toggle_btn],
-        [
-            InlineKeyboardButton("➕ افزودن ارز", callback_data="menu_add"),
-            InlineKeyboardButton("➖ حذف ارز",    callback_data="menu_remove"),
-        ],
-        [InlineKeyboardButton("🎯 بازه معاملاتی",      callback_data="menu_mode")],
-        [InlineKeyboardButton("💼 تنظیم سرمایه",       callback_data="menu_capital")],
-        [InlineKeyboardButton("🔔 هشدار قیمت",         callback_data="menu_alerts")],
-        [InlineKeyboardButton("📋 ارزهای فعال",        callback_data="menu_list")],
-        [InlineKeyboardButton("📁 پوزیشن‌های فعال",    callback_data="menu_positions")],
-        [InlineKeyboardButton("📈 تاریخچه سیگنال‌ها",  callback_data="menu_history")],
-        [InlineKeyboardButton("⏱ بازه ارسال",          callback_data="menu_interval")],
+        [alert_btn],
+        [InlineKeyboardButton("➕ افزودن ارز", callback_data="menu_add"),
+         InlineKeyboardButton("➖ حذف ارز", callback_data="menu_remove")],
+        [InlineKeyboardButton("🎯 بازه معاملاتی", callback_data="menu_mode")],
+        [InlineKeyboardButton("💼 تنظیم سرمایه", callback_data="menu_capital")],
+        [InlineKeyboardButton("🔔 هشدار قیمت", callback_data="menu_alerts")],
+        [InlineKeyboardButton("📋 ارزهای فعال", callback_data="menu_list")],
+        [InlineKeyboardButton("📁 پوزیشن‌های فعال", callback_data="menu_positions")],
+        [InlineKeyboardButton("📈 تاریخچه", callback_data="menu_history"),
+         InlineKeyboardButton("🏆 عملکرد", callback_data="menu_performance")],
+        [InlineKeyboardButton("🧪 بک‌تست", callback_data="menu_backtest"),
+         InlineKeyboardButton("🐋 نهنگ‌ها", callback_data="menu_whale")],
+        [InlineKeyboardButton("⏱ بازه ارسال", callback_data="menu_interval")],
     ]
     status = "🟢 فعال" if is_active else "🔴 متوقف"
-    text   = (
-        f"🤖 ربات تحلیل ارز دیجیتال\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"وضعیت: {status}\n"
-        f"ارزها: {len(symbols)} عدد\n"
-        f"بازه: {TRADING_MODES[mode_key]['label']}\n"
-        f"سرمایه: {cap_text}\n\n"
-        f"یک گزینه انتخاب کن:"
-    )
+    text = (f"🤖 ربات تحلیل ارز دیجیتال\n━━━━━━━━━━━━━━━\n"
+            f"وضعیت: {status}\n"
+            f"ارزها: {len(symbols)} عدد\n"
+            f"بازه: {TRADING_MODES[mode_key]['label']}\n"
+            f"سرمایه: {cap_text}\n"
+            f"آلرت خودکار: {'✅' if auto_alert else '❌'}\n\n"
+            f"یک گزینه انتخاب کن:")
     return text, InlineKeyboardMarkup(keyboard)
 
 def price_menu(chat_id):
-    symbols = user_data.get(chat_id, {}).get("symbols", [])
-    keyboard = []
-    row = []
+    symbols = user_data.get(chat_id,{}).get("symbols",[])
+    keyboard = []; row = []
     for sym in symbols:
-        row.append(InlineKeyboardButton(sym.replace("USDT", ""), callback_data=f"price_{sym}"))
-        if len(row) == 3: keyboard.append(row); row = []
+        row.append(InlineKeyboardButton(sym.replace("USDT",""), callback_data=f"price_{sym}"))
+        if len(row)==3: keyboard.append(row); row=[]
     if row: keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🔍 ارز دیگه",  callback_data="price_custom")])
-    keyboard.append([InlineKeyboardButton("🔙 برگشت",      callback_data="back_main")])
-    return "💰 قیمت لحظه‌ای کدوم ارز رو میخوای؟", InlineKeyboardMarkup(keyboard)
+    keyboard.append([InlineKeyboardButton("🔍 ارز دیگه", callback_data="price_custom")])
+    keyboard.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
+    return "💰 قیمت لحظه‌ای کدوم ارز؟", InlineKeyboardMarkup(keyboard)
 
 def mode_menu():
-    keyboard = [[InlineKeyboardButton(v["label"], callback_data=f"setmode_{k}")] for k, v in TRADING_MODES.items()]
+    keyboard = []
+    for k, v in TRADING_MODES.items():
+        desc = {"scalp":"سریع، ریسک کم، حجم مهم","short":"متعادل، MACD+RSI","mid":"ایچیموکو+ساختار","long":"EMA200+ساختار بلندمدت"}[k]
+        keyboard.append([InlineKeyboardButton(f"{v['label']}\n{desc}", callback_data=f"setmode_{k}")])
     keyboard.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
-    return "🎯 بازه معاملاتی خودت رو انتخاب کن:", InlineKeyboardMarkup(keyboard)
+    return "🎯 بازه معاملاتی رو انتخاب کن:", InlineKeyboardMarkup(keyboard)
 
 def add_symbol_menu(chat_id):
-    current  = set(user_data.get(chat_id, {}).get("symbols", []))
-    keyboard = []; row = []
+    current=set(user_data.get(chat_id,{}).get("symbols",[])); keyboard=[]; row=[]
     for sym in AVAILABLE_SYMBOLS:
         if sym not in current:
-            row.append(InlineKeyboardButton(sym.replace("USDT", ""), callback_data=f"add_{sym}"))
-            if len(row) == 3: keyboard.append(row); row = []
+            row.append(InlineKeyboardButton(sym.replace("USDT",""), callback_data=f"add_{sym}"))
+            if len(row)==3: keyboard.append(row); row=[]
     if row: keyboard.append(row)
     keyboard.append([InlineKeyboardButton("✏️ ارز دلخواه", callback_data="add_custom")])
-    keyboard.append([InlineKeyboardButton("🔙 برگشت",       callback_data="back_main")])
+    keyboard.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
     return "➕ کدوم ارز رو اضافه کنی؟", InlineKeyboardMarkup(keyboard)
 
 def remove_symbol_menu(chat_id):
-    current  = user_data.get(chat_id, {}).get("symbols", [])
-    keyboard = []; row = []
+    current=user_data.get(chat_id,{}).get("symbols",[]); keyboard=[]; row=[]
     for sym in current:
         row.append(InlineKeyboardButton(f"❌{sym.replace('USDT','')}", callback_data=f"rem_{sym}"))
-        if len(row) == 3: keyboard.append(row); row = []
+        if len(row)==3: keyboard.append(row); row=[]
     if row: keyboard.append(row)
     keyboard.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
     return "➖ کدوم ارز رو حذف کنی؟", InlineKeyboardMarkup(keyboard)
 
 def alerts_menu(chat_id):
-    alerts  = user_data.get(chat_id, {}).get("price_alerts", {})
-    symbols = user_data.get(chat_id, {}).get("symbols", [])
-    keyboard = []
+    alerts=user_data.get(chat_id,{}).get("price_alerts",{})
+    symbols=user_data.get(chat_id,{}).get("symbols",[]); keyboard=[]
     for sym in symbols:
-        a     = alerts.get(sym, {})
-        label = sym.replace("USDT", "")
-        info  = ""
+        a=alerts.get(sym,{}); label=sym.replace("USDT",""); info=""
         if a.get("above"): info += f"↑{format_price(a['above'])} "
         if a.get("below"): info += f"↓{format_price(a['below'])}"
-        display = f"🔔{label}" + (f" [{info.strip()}]" if info else "")
+        display=f"🔔{label}"+(f" [{info.strip()}]" if info else "")
         keyboard.append([InlineKeyboardButton(display, callback_data=f"alert_set_{sym}")])
-    if alerts:
-        keyboard.append([InlineKeyboardButton("🗑 حذف همه هشدارها", callback_data="alert_clear_all")])
+    if alerts: keyboard.append([InlineKeyboardButton("🗑 حذف همه", callback_data="alert_clear_all")])
     keyboard.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
-    return "🔔 هشدار قیمت — کدوم ارز رو تنظیم کنی؟", InlineKeyboardMarkup(keyboard)
+    return "🔔 هشدار قیمت:", InlineKeyboardMarkup(keyboard)
+
+# =========================
+# SMART AUTO ALERT
+# =========================
+async def check_auto_alerts(bot):
+    """بررسی خودکار سیگنال‌های قوی و ارسال Alert"""
+    for chat_id, udata in list(user_data.items()):
+        if not udata.get("auto_alert_enabled", True): continue
+        if not udata.get("active", True): continue
+        symbols   = udata.get("symbols", [])
+        mode_key  = udata.get("trading_mode", "short")
+        threshold = udata.get("auto_alert_threshold", 8)
+        capital   = udata.get("capital")
+
+        for symbol in symbols:
+            try:
+                a = await full_analysis(symbol, mode_key)
+                if not a: continue
+                if a["direction"] == "NEUTRAL ⚪": continue
+                # فقط سیگنال‌های قوی
+                if abs(a["score"]) < threshold: continue
+                if a["agreement"] < 75: continue
+
+                # چک کن آیا همین سیگنال رو قبلاً فرستادیم
+                last_alerts = udata.setdefault("last_auto_alerts", {})
+                last = last_alerts.get(symbol, {})
+                # اگر همین جهت رو در ۴ ساعت گذشته فرستادیم، نفرست
+                if last.get("direction") == a["direction"]:
+                    last_time = datetime.fromisoformat(last["time"])
+                    if datetime.now() - last_time < timedelta(hours=4): continue
+
+                fg = await get_fear_greed()
+                fr = await get_funding_rate(symbol)
+
+                msg  = f"🚨 آلرت خودکار — سیگنال قوی!\n"
+                msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+                msg += build_analysis_message(a, capital, fg, fr)
+
+                await bot.send_message(chat_id=int(chat_id), text=msg, disable_web_page_preview=True)
+
+                last_alerts[symbol] = {"direction": a["direction"], "time": datetime.now().isoformat()}
+                # ذخیره پوزیشن
+                if a["expiry"]:
+                    udata.setdefault("active_positions", {})[symbol] = {
+                        "direction": a["direction"], "entry": a["entry"],
+                        "stop_loss": a["stop_loss"], "tp1": a["tp1"], "expiry": a["expiry"],
+                    }
+                    stats = udata.setdefault("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
+                    stats["total"] += 1
+                    history = udata.setdefault("signal_history", [])
+                    history.append({"symbol": symbol, "direction": a["direction"], "entry": a["entry"],
+                                    "tp1": a["tp1"], "stop_loss": a["stop_loss"],
+                                    "time": datetime.now().isoformat(), "result": "در انتظار", "mode": mode_key})
+                    if len(history) > 200: udata["signal_history"] = history[-200:]
+                save_data()
+                await asyncio.sleep(1)
+            except Exception as e:
+                log.error(f"check_auto_alerts {chat_id}/{symbol}: {e}")
 
 # =========================
 # PRICE ALERT CHECKER
 # =========================
 async def check_price_alerts(bot):
     for chat_id, udata in list(user_data.items()):
-        alerts    = udata.get("price_alerts", {})
-        triggered = []
+        alerts=udata.get("price_alerts",{}); triggered=[]
         for sym, a in list(alerts.items()):
-            ticker = await get_ticker(sym)
+            ticker=await get_ticker(sym)
             if not ticker: continue
-            price = ticker["price"]
+            price=ticker["price"]
             if a.get("above") and price >= a["above"]:
                 try:
-                    await bot.send_message(
-                        chat_id=int(chat_id),
-                        text=f"🔔 هشدار قیمت!\n{sym} به {format_price(price)} رسید\n✅ از {format_price(a['above'])} عبور کرد"
-                    )
-                except Exception as e:
-                    log.error(f"Alert send error: {e}")
-                triggered.append((sym, "above"))
+                    await bot.send_message(chat_id=int(chat_id),
+                        text=f"🔔 هشدار قیمت!\n{sym} به {format_price(price)} رسید\n✅ از {format_price(a['above'])} عبور کرد")
+                except Exception as e: log.error(f"Alert: {e}")
+                triggered.append((sym,"above"))
             if a.get("below") and price <= a["below"]:
                 try:
-                    await bot.send_message(
-                        chat_id=int(chat_id),
-                        text=f"🔔 هشدار قیمت!\n{sym} به {format_price(price)} رسید\n❌ از {format_price(a['below'])} پایین‌تر رفت"
-                    )
-                except Exception as e:
-                    log.error(f"Alert send error: {e}")
-                triggered.append((sym, "below"))
+                    await bot.send_message(chat_id=int(chat_id),
+                        text=f"🔔 هشدار قیمت!\n{sym} به {format_price(price)} رسید\n❌ از {format_price(a['below'])} پایین‌تر رفت")
+                except Exception as e: log.error(f"Alert: {e}")
+                triggered.append((sym,"below"))
         for sym, side in triggered:
-            if sym in alerts:
-                alerts[sym].pop(side, None)
-                if not alerts[sym]:
-                    alerts.pop(sym, None)
-        if triggered:
-            save_data()
+            if sym in alerts: alerts[sym].pop(side,None); (alerts.pop(sym,None) if not alerts.get(sym) else None)
+        if triggered: save_data()
 
 # =========================
 # POSITION TRACKER
@@ -1263,97 +1855,67 @@ async def check_price_alerts(bot):
 async def check_expired_positions(bot):
     now = datetime.now()
     for chat_id, udata in list(user_data.items()):
-        positions = udata.get("active_positions", {})
-        expired   = [s for s, p in positions.items() if p.get("expiry") and now >= datetime.fromisoformat(p["expiry"])]
+        positions=udata.get("active_positions",{})
+        expired=[s for s,p in positions.items() if p.get("expiry") and now>=datetime.fromisoformat(p["expiry"])]
         for sym in expired:
             try:
-                pos       = positions.pop(sym)
-                ticker    = await get_ticker(sym)
-                if not ticker:
-                    log.warning(f"No ticker for expired {sym}")
-                    continue
-                current   = ticker["price"]
-                entry     = pos["entry"]
-                direction = pos["direction"]
-                tp1       = pos.get("tp1")
-                sl        = pos.get("stop_loss")
+                pos=positions.pop(sym); ticker=await get_ticker(sym)
+                if not ticker: continue
+                current=ticker["price"]; entry=pos["entry"]; direction=pos["direction"]
+                tp1=pos.get("tp1"); sl=pos.get("stop_loss")
                 if "LONG" in direction:
-                    pnl_pct = (current - entry) / entry * 100
-                    hit_tp1 = tp1 and current >= tp1
-                    hit_sl  = sl  and current <= sl
+                    pnl_pct=(current-entry)/entry*100; hit_tp1=tp1 and current>=tp1; hit_sl=sl and current<=sl
                 else:
-                    pnl_pct = (entry - current) / entry * 100
-                    hit_tp1 = tp1 and current <= tp1
-                    hit_sl  = sl  and current >= sl
-                stats = udata.setdefault("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
-                if hit_tp1:
-                    result = "✅ موفق — به TP1 رسید!"; stats["win"] += 1
-                elif hit_sl:
-                    result = "❌ استاپ لاس خورد";       stats["loss"] += 1
-                elif pnl_pct > 0:
-                    result = f"🟡 سود جزئی ({pnl_pct:+.2f}%)"; stats["neutral_exit"] += 1
-                else:
-                    result = f"🟠 ضرر جزئی ({pnl_pct:+.2f}%)"; stats["neutral_exit"] += 1
-                history = udata.setdefault("signal_history", [])
+                    pnl_pct=(entry-current)/entry*100; hit_tp1=tp1 and current<=tp1; hit_sl=sl and current>=sl
+                stats=udata.setdefault("signal_stats",{"total":0,"win":0,"loss":0,"neutral_exit":0})
+                if hit_tp1:     result="✅ موفق — به TP1 رسید!"; stats["win"]+=1
+                elif hit_sl:    result="❌ استاپ لاس خورد";       stats["loss"]+=1
+                elif pnl_pct>0: result=f"🟡 سود جزئی ({pnl_pct:+.2f}%)"; stats["neutral_exit"]+=1
+                else:           result=f"🟠 ضرر جزئی ({pnl_pct:+.2f}%)"; stats["neutral_exit"]+=1
+                history=udata.setdefault("signal_history",[])
                 for h in history:
-                    if h.get("symbol") == sym and h.get("result") == "در انتظار":
-                        h["result"] = result; h["exit_price"] = current; h["pnl_pct"] = round(pnl_pct, 2)
-                        break
-                await bot.send_message(
-                    chat_id=int(chat_id),
-                    text=(
-                        f"⏰ پوزیشن {sym} منقضی شد!\n\n"
-                        f"جهت: {direction}\n"
-                        f"ورود: {format_price(entry)}\n"
-                        f"قیمت الان: {format_price(current)}\n"
-                        f"P&L: {pnl_pct:+.2f}%\n\n"
-                        f"نتیجه: {result}"
-                    )
-                )
-                log.info(f"Expired: {chat_id}/{sym} → {result}")
-            except Exception as e:
-                log.error(f"check_expired {chat_id}/{sym}: {e}")
+                    if h.get("symbol")==sym and h.get("result")=="در انتظار":
+                        h["result"]=result; h["exit_price"]=current; h["pnl_pct"]=round(pnl_pct,2); break
+                await bot.send_message(chat_id=int(chat_id),
+                    text=(f"⏰ پوزیشن {sym} منقضی شد!\n\n"
+                          f"جهت: {direction}\nورود: {format_price(entry)}\n"
+                          f"قیمت الان: {format_price(current)}\nP&L: {pnl_pct:+.2f}%\n\nنتیجه: {result}"))
+            except Exception as e: log.error(f"expired {chat_id}/{sym}: {e}")
         save_data()
 
 # =========================
 # CORE SENDER
 # =========================
 async def send_analysis(bot, chat_id, symbols):
-    if not user_data.get(chat_id, {}).get("active", True): return
-    mode_key = user_data.get(chat_id, {}).get("trading_mode", "short")
-    capital  = user_data.get(chat_id, {}).get("capital")
+    if not user_data.get(chat_id,{}).get("active",True): return
+    mode_key=user_data.get(chat_id,{}).get("trading_mode","short")
+    capital=user_data.get(chat_id,{}).get("capital")
+
+    fg = await get_fear_greed()
+
     for symbol in symbols:
         try:
-            a = await full_analysis(symbol, mode_key)
+            a=await full_analysis(symbol, mode_key)
             if not a:
                 await bot.send_message(chat_id=int(chat_id), text=f"❌ خطا در تحلیل {symbol}")
                 continue
-            if a["direction"] != "NEUTRAL ⚪" and a["expiry"]:
-                user_data[chat_id].setdefault("active_positions", {})[symbol] = {
-                    "direction": a["direction"], "entry": a["entry"],
-                    "stop_loss": a["stop_loss"], "tp1":   a["tp1"],
-                    "expiry":    a["expiry"],
-                }
-                stats = user_data[chat_id].setdefault("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
-                stats["total"] += 1
-                history = user_data[chat_id].setdefault("signal_history", [])
-                history.append({
-                    "symbol":    symbol,
-                    "direction": a["direction"],
-                    "entry":     a["entry"],
-                    "tp1":       a["tp1"],
-                    "stop_loss": a["stop_loss"],
-                    "time":      datetime.now().isoformat(),
-                    "result":    "در انتظار",
-                    "mode":      mode_key,
-                })
-                if len(history) > 200: user_data[chat_id]["signal_history"] = history[-200:]
+            fr    = await get_funding_rate(symbol)
+            whale = await get_whale_alerts(symbol)
+            if a["direction"]!="NEUTRAL ⚪" and a["expiry"]:
+                user_data[chat_id].setdefault("active_positions",{})[symbol] = {
+                    "direction":a["direction"],"entry":a["entry"],
+                    "stop_loss":a["stop_loss"],"tp1":a["tp1"],"expiry":a["expiry"],}
+                stats=user_data[chat_id].setdefault("signal_stats",{"total":0,"win":0,"loss":0,"neutral_exit":0})
+                stats["total"]+=1
+                history=user_data[chat_id].setdefault("signal_history",[])
+                history.append({"symbol":symbol,"direction":a["direction"],"entry":a["entry"],
+                                 "tp1":a["tp1"],"stop_loss":a["stop_loss"],
+                                 "time":datetime.now().isoformat(),"result":"در انتظار","mode":mode_key})
+                if len(history)>200: user_data[chat_id]["signal_history"]=history[-200:]
                 save_data()
-            await bot.send_message(
-                chat_id=int(chat_id),
-                text=build_analysis_message(a, capital),
-                disable_web_page_preview=True
-            )
+            await bot.send_message(chat_id=int(chat_id),
+                text=build_analysis_message(a, capital, fg, fr, whale),
+                disable_web_page_preview=True)
         except Exception as e:
             log.error(f"send_analysis {chat_id}/{symbol}: {e}")
 
@@ -1361,315 +1923,311 @@ async def send_analysis(bot, chat_id, symbols):
 # JOB SYSTEM
 # =========================
 def schedule_user_job(app, chat_id):
-    chat_id  = str(chat_id)
-    mode_key = user_data[chat_id].get("trading_mode", "short")
-    interval = user_data[chat_id].get("interval") or TRADING_MODES[mode_key]["interval_minutes"]
+    chat_id=str(chat_id); mode_key=user_data[chat_id].get("trading_mode","short")
+    interval=user_data[chat_id].get("interval") or TRADING_MODES[mode_key]["interval_minutes"]
     if chat_id in user_jobs:
         try: user_jobs[chat_id].remove()
         except: pass
-    job = scheduler.add_job(
-        send_analysis, "interval", minutes=interval,
-        args=[app.bot, chat_id, user_data[chat_id]["symbols"]],
-        id=f"user_{chat_id}", replace_existing=True
-    )
-    user_jobs[chat_id] = job
+    job=scheduler.add_job(send_analysis,"interval",minutes=interval,
+                          args=[app.bot,chat_id,user_data[chat_id]["symbols"]],
+                          id=f"user_{chat_id}",replace_existing=True)
+    user_jobs[chat_id]=job
     log.info(f"Job scheduled: {chat_id} | mode={mode_key} | interval={interval}m")
 
 # =========================
 # HANDLERS
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    init_user(chat_id)
-
+    chat_id=str(update.effective_chat.id); init_user(chat_id)
     is_new, uinfo = register_user(update)
-
-    if is_new and ADMIN_ID and chat_id != ADMIN_ID:
+    if is_new and ADMIN_ID and chat_id!=ADMIN_ID:
         try:
-            await context.bot.send_message(
-                chat_id=int(ADMIN_ID),
-                text=(
-                    f"👤 کاربر جدید!\n"
-                    f"━━━━━━━━━━━━━━\n"
-                    f"🆔 ID:       {uinfo['chat_id']}\n"
-                    f"📛 نام:      {uinfo['first_name']} {uinfo['last_name']}\n"
-                    f"👤 یوزر:    {uinfo['username']}\n"
-                    f"🕐 زمان:     {datetime.now().strftime('%H:%M  %Y-%m-%d')}"
-                )
-            )
-        except Exception as e:
-            log.error(f"Admin notify error: {e}")
-
+            await context.bot.send_message(chat_id=int(ADMIN_ID),
+                text=(f"👤 کاربر جدید!\n━━━━━━━━━━━━━━\n"
+                      f"🆔 ID: {uinfo['chat_id']}\n📛 نام: {uinfo['first_name']} {uinfo['last_name']}\n"
+                      f"👤 یوزر: {uinfo['username']}\n🕐 زمان: {datetime.now().strftime('%H:%M  %Y-%m-%d')}"))
+        except Exception as e: log.error(f"Admin notify: {e}")
     text, markup = main_menu(chat_id)
     await update.message.reply_text(text, reply_markup=markup)
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
-    await query.answer()
-    chat_id = str(query.message.chat.id)
-    data    = query.data
-    init_user(chat_id)
+    query=update.callback_query; await query.answer()
+    chat_id=str(query.message.chat.id); data=query.data; init_user(chat_id)
 
-    if data == "toggle_off":
-        user_data[chat_id]["active"] = False; save_data()
-        t, m = main_menu(chat_id)
-        await query.edit_message_text("⏹ ارسال خودکار متوقف شد.\n\n" + t, reply_markup=m); return
+    if data=="toggle_off":
+        user_data[chat_id]["active"]=False; save_data()
+        t,m=main_menu(chat_id); await query.edit_message_text("⏹ ارسال خودکار متوقف شد.\n\n"+t,reply_markup=m); return
 
-    if data == "toggle_on":
-        user_data[chat_id]["active"] = True; save_data()
-        schedule_user_job(context.application, chat_id)
-        t, m = main_menu(chat_id)
-        await query.edit_message_text("▶️ ارسال خودکار فعال شد.\n\n" + t, reply_markup=m); return
+    if data=="toggle_on":
+        user_data[chat_id]["active"]=True; save_data()
+        schedule_user_job(context.application,chat_id)
+        t,m=main_menu(chat_id); await query.edit_message_text("▶️ ارسال خودکار فعال شد.\n\n"+t,reply_markup=m); return
 
-    if data == "do_analysis":
+    if data=="toggle_autoalert":
+        cur=user_data[chat_id].get("auto_alert_enabled",True)
+        user_data[chat_id]["auto_alert_enabled"]=not cur; save_data()
+        t,m=main_menu(chat_id)
+        status="✅ روشن" if not cur else "❌ خاموش"
+        await query.edit_message_text(f"🔔 آلرت خودکار {status} شد.\n\n"+t,reply_markup=m); return
+
+    if data=="do_analysis":
         await query.edit_message_text("⏳ در حال تحلیل چندلایه‌ای...")
-        await send_analysis(context.bot, chat_id, user_data[chat_id]["symbols"])
-        t, m = main_menu(chat_id)
-        await context.bot.send_message(chat_id=int(chat_id), text=t, reply_markup=m); return
+        await send_analysis(context.bot,chat_id,user_data[chat_id]["symbols"])
+        t,m=main_menu(chat_id)
+        await context.bot.send_message(chat_id=int(chat_id),text=t,reply_markup=m); return
 
-    if data == "menu_price":
-        t, m = price_menu(chat_id); await query.edit_message_text(t, reply_markup=m); return
+    if data=="menu_price":
+        t,m=price_menu(chat_id); await query.edit_message_text(t,reply_markup=m); return
 
-    if data.startswith("price_") and data != "price_custom":
-        sym = data[6:]; ticker = await get_ticker(sym)
-        await query.edit_message_text(build_price_message(sym, ticker))
-        await asyncio.sleep(1)
-        t, m = price_menu(chat_id)
-        await context.bot.send_message(chat_id=int(chat_id), text=t, reply_markup=m); return
+    if data.startswith("price_") and data!="price_custom":
+        sym=data[6:]; ticker=await get_ticker(sym)
+        await query.edit_message_text(build_price_message(sym,ticker))
+        await asyncio.sleep(1); t,m=price_menu(chat_id)
+        await context.bot.send_message(chat_id=int(chat_id),text=t,reply_markup=m); return
 
-    if data == "price_custom":
-        user_states[chat_id] = "waiting_price_symbol"
+    if data=="price_custom":
+        user_states[chat_id]="waiting_price_symbol"
         await query.edit_message_text("🔍 نام ارز رو بنویس (مثلاً: BTC)\n\nبرای لغو /cancel بزن"); return
 
-    if data == "menu_mode":
-        t, m = mode_menu(); await query.edit_message_text(t, reply_markup=m); return
+    if data=="menu_mode":
+        t,m=mode_menu(); await query.edit_message_text(t,reply_markup=m); return
 
     if data.startswith("setmode_"):
-        mk = data[8:]
+        mk=data[8:]
         if mk in TRADING_MODES:
-            user_data[chat_id]["trading_mode"] = mk
-            user_data[chat_id]["interval"] = TRADING_MODES[mk]["interval_minutes"]
-            save_data(); schedule_user_job(context.application, chat_id)
-        t, m = main_menu(chat_id)
-        await query.edit_message_text(f"✅ بازه روی {TRADING_MODES[mk]['label']} تنظیم شد.\n\n" + t, reply_markup=m); return
+            user_data[chat_id]["trading_mode"]=mk
+            user_data[chat_id]["interval"]=TRADING_MODES[mk]["interval_minutes"]
+            save_data(); schedule_user_job(context.application,chat_id)
+        t,m=main_menu(chat_id)
+        await query.edit_message_text(f"✅ بازه روی {TRADING_MODES[mk]['label']} تنظیم شد.\n\n"+t,reply_markup=m); return
 
-    if data == "menu_capital":
-        cap = user_data[chat_id].get("capital")
-        cur = f"سرمایه فعلی: ${cap:,.0f}" if cap else "سرمایه‌ای تنظیم نشده"
-        user_states[chat_id] = "waiting_capital"
-        await query.edit_message_text(
-            f"💼 مدیریت سرمایه\n{cur}\n\n"
-            "سرمایه کل خودت رو به دلار بنویس:\n"
-            "(مثلاً: 1000 یا 5000)\n\n"
-            "برای لغو /cancel بزن"
-        ); return
+    if data=="menu_capital":
+        cap=user_data[chat_id].get("capital")
+        cur=f"سرمایه فعلی: ${cap:,.0f}" if cap else "سرمایه‌ای تنظیم نشده"
+        user_states[chat_id]="waiting_capital"
+        await query.edit_message_text(f"💼 مدیریت سرمایه\n{cur}\n\nسرمایه کل رو به دلار بنویس:\n(مثلاً: 1000)\n\nبرای لغو /cancel بزن"); return
 
-    if data == "menu_alerts":
-        t, m = alerts_menu(chat_id); await query.edit_message_text(t, reply_markup=m); return
+    if data=="menu_alerts":
+        t,m=alerts_menu(chat_id); await query.edit_message_text(t,reply_markup=m); return
 
     if data.startswith("alert_set_"):
-        sym = data[10:]
-        user_states[chat_id] = f"waiting_alert_{sym}"
-        existing = user_data[chat_id].get("price_alerts", {}).get(sym, {})
-        info = ""
-        if existing.get("above"): info += f"\nهشدار بالا: {format_price(existing['above'])}"
-        if existing.get("below"): info += f"\nهشدار پایین: {format_price(existing['below'])}"
-        await query.edit_message_text(
-            f"🔔 تنظیم هشدار برای {sym}{info}\n\n"
-            "فرمت: above=50000 یا below=40000\n"
-            "مثال: above=50000\n\n"
-            "برای لغو /cancel بزن"
-        ); return
+        sym=data[10:]; user_states[chat_id]=f"waiting_alert_{sym}"
+        existing=user_data[chat_id].get("price_alerts",{}).get(sym,{}); info=""
+        if existing.get("above"): info+=f"\nهشدار بالا: {format_price(existing['above'])}"
+        if existing.get("below"): info+=f"\nهشدار پایین: {format_price(existing['below'])}"
+        await query.edit_message_text(f"🔔 تنظیم هشدار برای {sym}{info}\n\nفرمت: above=50000 یا below=40000\n\nبرای لغو /cancel بزن"); return
 
-    if data == "alert_clear_all":
-        user_data[chat_id]["price_alerts"] = {}; save_data()
-        t, m = alerts_menu(chat_id)
-        await query.edit_message_text("✅ همه هشدارها حذف شدن.\n\n" + t, reply_markup=m); return
+    if data=="alert_clear_all":
+        user_data[chat_id]["price_alerts"]={}; save_data()
+        t,m=alerts_menu(chat_id); await query.edit_message_text("✅ همه هشدارها حذف شدن.\n\n"+t,reply_markup=m); return
 
-    if data == "menu_add":
-        t, m = add_symbol_menu(chat_id); await query.edit_message_text(t, reply_markup=m); return
+    if data=="menu_add":
+        t,m=add_symbol_menu(chat_id); await query.edit_message_text(t,reply_markup=m); return
 
-    if data.startswith("add_") and data != "add_custom":
-        sym = data[4:]
+    if data.startswith("add_") and data!="add_custom":
+        sym=data[4:]
         if sym not in user_data[chat_id]["symbols"]:
-            user_data[chat_id]["symbols"].append(sym); save_data()
-            schedule_user_job(context.application, chat_id)
-        t, m = add_symbol_menu(chat_id)
-        await query.edit_message_text(f"✅ {sym} اضافه شد!\n\n" + t, reply_markup=m); return
+            user_data[chat_id]["symbols"].append(sym); save_data(); schedule_user_job(context.application,chat_id)
+        t,m=add_symbol_menu(chat_id); await query.edit_message_text(f"✅ {sym} اضافه شد!\n\n"+t,reply_markup=m); return
 
-    if data == "add_custom":
-        user_states[chat_id] = "waiting_custom_symbol"
+    if data=="add_custom":
+        user_states[chat_id]="waiting_custom_symbol"
         await query.edit_message_text("✏️ نام ارز رو بنویس (مثلاً: LINK)\n\nبرای لغو /cancel بزن"); return
 
-    if data == "menu_remove":
-        t, m = remove_symbol_menu(chat_id); await query.edit_message_text(t, reply_markup=m); return
+    if data=="menu_remove":
+        t,m=remove_symbol_menu(chat_id); await query.edit_message_text(t,reply_markup=m); return
 
     if data.startswith("rem_"):
-        sym  = data[4:]; syms = user_data[chat_id]["symbols"]
-        if len(syms) == 1:
-            await query.answer("حداقل یک ارز باید فعال باشد!", show_alert=True); return
+        sym=data[4:]; syms=user_data[chat_id]["symbols"]
+        if len(syms)==1:
+            await query.answer("حداقل یک ارز باید فعال باشد!",show_alert=True); return
         if sym in syms:
-            syms.remove(sym)
-            user_data[chat_id].get("active_positions", {}).pop(sym, None)
-            save_data(); schedule_user_job(context.application, chat_id)
-        t, m = remove_symbol_menu(chat_id)
-        await query.edit_message_text(f"🗑 {sym} حذف شد.\n\n" + t, reply_markup=m); return
+            syms.remove(sym); user_data[chat_id].get("active_positions",{}).pop(sym,None)
+            save_data(); schedule_user_job(context.application,chat_id)
+        t,m=remove_symbol_menu(chat_id); await query.edit_message_text(f"🗑 {sym} حذف شد.\n\n"+t,reply_markup=m); return
 
-    if data == "menu_list":
-        syms = user_data[chat_id]["symbols"]
-        text = "📋 ارزهای فعال:\n\n" + "\n".join(f"  • {s}" for s in syms)
-        kb   = [[InlineKeyboardButton("🔙 برگشت", callback_data="back_main")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb)); return
+    if data=="menu_list":
+        syms=user_data[chat_id]["symbols"]
+        text="📋 ارزهای فعال:\n\n"+"\n".join(f"  • {s}" for s in syms)
+        kb=[[InlineKeyboardButton("🔙 برگشت",callback_data="back_main")]]
+        await query.edit_message_text(text,reply_markup=InlineKeyboardMarkup(kb)); return
 
-    if data == "menu_positions":
-        positions = user_data[chat_id].get("active_positions", {})
-        stats     = user_data[chat_id].get("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
-        text      = "📁 پوزیشن‌های فعال:\n\n" if positions else "هیچ پوزیشن فعالی نداری\n\n"
+    if data=="menu_positions":
+        positions=user_data[chat_id].get("active_positions",{})
+        stats=user_data[chat_id].get("signal_stats",{"total":0,"win":0,"loss":0,"neutral_exit":0})
+        text="📁 پوزیشن‌های فعال:\n\n" if positions else "هیچ پوزیشن فعالی نداری\n\n"
         for sym, pos in positions.items():
-            exp   = datetime.fromisoformat(pos["expiry"]).strftime("%H:%M")
-            text += f"• {sym} | {pos['direction']}\n"
-            text += f"  ورود: {format_price(pos['entry'])} | SL: {format_price(pos['stop_loss'])}\n"
-            text += f"  TP1: {format_price(pos['tp1'])} | انقضا: {exp}\n\n"
-        total = stats["total"]; win = stats["win"]; loss = stats["loss"]
-        wr    = round(win / total * 100, 1) if total > 0 else 0
-        text += f"📊 آمار کلی: کل {total} | ✅{win} | ❌{loss} | نرخ موفقیت: {wr}%"
-        kb    = [[InlineKeyboardButton("🔙 برگشت", callback_data="back_main")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb)); return
+            exp=datetime.fromisoformat(pos["expiry"]).strftime("%H:%M")
+            text+=f"• {sym} | {pos['direction']}\n  ورود: {format_price(pos['entry'])} | SL: {format_price(pos['stop_loss'])}\n  TP1: {format_price(pos['tp1'])} | انقضا: {exp}\n\n"
+        total=stats["total"]; win=stats["win"]; loss=stats["loss"]
+        wr=round(win/total*100,1) if total>0 else 0
+        text+=f"📊 آمار کلی: کل {total} | ✅{win} | ❌{loss} | نرخ موفقیت: {wr}%"
+        kb=[[InlineKeyboardButton("🔙 برگشت",callback_data="back_main")]]
+        await query.edit_message_text(text,reply_markup=InlineKeyboardMarkup(kb)); return
 
-    if data == "menu_history":
-        history = user_data[chat_id].get("signal_history", [])
-        stats   = user_data[chat_id].get("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
-        kb      = [[InlineKeyboardButton("🔙 برگشت", callback_data="back_main")]]
-        await query.edit_message_text(build_history_message(history, stats), reply_markup=InlineKeyboardMarkup(kb)); return
+    if data=="menu_history":
+        history=user_data[chat_id].get("signal_history",[])
+        stats=user_data[chat_id].get("signal_stats",{"total":0,"win":0,"loss":0,"neutral_exit":0})
+        kb=[[InlineKeyboardButton("🔙 برگشت",callback_data="back_main")]]
+        await query.edit_message_text(build_history_message(history,stats),reply_markup=InlineKeyboardMarkup(kb)); return
 
-    if data == "menu_interval":
-        keyboard = [
-            [InlineKeyboardButton("۱۵ دقیقه", callback_data="setint_15"),
-             InlineKeyboardButton("۳۰ دقیقه", callback_data="setint_30"),
-             InlineKeyboardButton("۱ ساعت",   callback_data="setint_60")],
-            [InlineKeyboardButton("۲ ساعت",   callback_data="setint_120"),
-             InlineKeyboardButton("۴ ساعت",   callback_data="setint_240"),
-             InlineKeyboardButton("۸ ساعت",   callback_data="setint_480")],
-            [InlineKeyboardButton("۱۲ ساعت",  callback_data="setint_720"),
-             InlineKeyboardButton("۲۴ ساعت",  callback_data="setint_1440")],
-            [InlineKeyboardButton("🔙 برگشت",  callback_data="back_main")],
-        ]
-        await query.edit_message_text("⏱ بازه ارسال خودکار رو انتخاب کن:", reply_markup=InlineKeyboardMarkup(keyboard)); return
+    if data=="menu_performance":
+        report=build_performance_report(chat_id)
+        kb=[[InlineKeyboardButton("🔙 برگشت",callback_data="back_main")]]
+        await query.edit_message_text(report,reply_markup=InlineKeyboardMarkup(kb)); return
+
+    if data=="menu_backtest":
+        symbols = user_data[chat_id].get("symbols",[]); mode_key = user_data[chat_id].get("trading_mode","short")
+        keyboard = []
+        for sym in symbols[:6]:
+            keyboard.append([InlineKeyboardButton(f"🧪 {sym.replace('USDT','')}", callback_data=f"bt_{sym}")])
+        keyboard.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
+        await query.edit_message_text(
+            f"🧪 بک‌تست — مود: {TRADING_MODES[mode_key]['label']}\n\nکدوم ارز رو بک‌تست کنم؟\n⚠️ ممکنه ۱۵-۳۰ ثانیه طول بکشه",
+            reply_markup=InlineKeyboardMarkup(keyboard)); return
+
+    if data.startswith("bt_"):
+        sym = data[3:]; mode_key = user_data[chat_id].get("trading_mode","short")
+        await query.edit_message_text(f"⏳ در حال بک‌تست {sym} روی {TRADING_MODES[mode_key]['label']}...\nلطفاً صبر کن")
+        result = await run_backtest(sym, mode_key, periods=15)
+        if not result:
+            await context.bot.send_message(chat_id=int(chat_id), text="❌ داده کافی برای بک‌تست وجود نداره")
+        else:
+            r = result
+            emoji = "🟢" if r["win_rate"]>=55 else ("🟡" if r["win_rate"]>=45 else "🔴")
+            msg  = f"🧪 نتیجه بک‌تست\n━━━━━━━━━━━━━━━━━━━━\n"
+            msg += f"📊 {r['symbol']} | {TRADING_MODES[r['mode']]['label']}\n\n"
+            msg += f"🔢 کل سیگنال:    {r['total']}\n"
+            msg += f"✅ موفق:         {r['wins']}\n"
+            msg += f"❌ ناموفق:       {r['losses']}\n"
+            msg += f"🟡 جزئی:         {r['partial']}\n"
+            msg += f"{emoji} نرخ موفقیت: {r['win_rate']}%\n\n"
+            msg += f"📋 آخرین سیگنال‌ها:\n"
+            for res in r["results"][-5:]:
+                oc_emoji = "✅" if res["outcome"]=="win" else ("❌" if res["outcome"]=="loss" else "🟡")
+                msg += f"  {oc_emoji} {res['direction']} @ {res['price']} (امتیاز:{res['score']})\n"
+            msg += f"\n⚠️ بک‌تست گذشته‌نگر است و ضمانت سود ندارد"
+            await context.bot.send_message(chat_id=int(chat_id), text=msg)
+        t,m=main_menu(chat_id)
+        await context.bot.send_message(chat_id=int(chat_id),text=t,reply_markup=m); return
+
+    if data=="menu_whale":
+        symbols = user_data[chat_id].get("symbols",[]); keyboard=[]
+        for sym in symbols[:6]:
+            keyboard.append([InlineKeyboardButton(f"🐋 {sym.replace('USDT','')}", callback_data=f"whale_{sym}")])
+        keyboard.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
+        await query.edit_message_text("🐋 بررسی تراکنش‌های بزرگ (آنچین):", reply_markup=InlineKeyboardMarkup(keyboard)); return
+
+    if data.startswith("whale_"):
+        sym = data[6:]
+        await query.edit_message_text(f"⏳ در حال بررسی آنچین {sym}...")
+        wa = await get_whale_alerts(sym)
+        if not wa:
+            msg = f"❌ داده آنچین برای {sym} در دسترس نیست"
+        else:
+            alert_emoji = "🚨" if wa.get("alert") else ("🟢" if wa.get("bullish") else "🟡")
+            msg  = f"🐋 تحلیل آنچین — {sym}\n━━━━━━━━━━━━━━━━━━━━\n"
+            msg += f"{alert_emoji} وضعیت: {'هشدار نهنگ!' if wa['alert'] else ('صعودی' if wa['bullish'] else 'عادی')}\n\n"
+            msg += f"📊 تراکنش‌های بزرگ: {wa.get('large_tx',0)}\n"
+            msg += f"👤 آدرس‌های فعال:  {wa.get('active_addr',0):,}\n"
+            msg += f"🔢 کل تراکنش‌ها:   {wa.get('tx_count',0):,}\n\n"
+            if wa["alert"]: msg += "⚠️ حجم تراکنش‌های بزرگ بالاتر از معمول — احتمال حرکت قیمتی\n"
+        await context.bot.send_message(chat_id=int(chat_id), text=msg)
+        t,m=main_menu(chat_id)
+        await context.bot.send_message(chat_id=int(chat_id),text=t,reply_markup=m); return
+
+    if data=="menu_interval":
+        keyboard=[[InlineKeyboardButton("۱۵ دقیقه",callback_data="setint_15"),
+                   InlineKeyboardButton("۳۰ دقیقه",callback_data="setint_30"),
+                   InlineKeyboardButton("۱ ساعت",callback_data="setint_60")],
+                  [InlineKeyboardButton("۲ ساعت",callback_data="setint_120"),
+                   InlineKeyboardButton("۴ ساعت",callback_data="setint_240"),
+                   InlineKeyboardButton("۸ ساعت",callback_data="setint_480")],
+                  [InlineKeyboardButton("۱۲ ساعت",callback_data="setint_720"),
+                   InlineKeyboardButton("۲۴ ساعت",callback_data="setint_1440")],
+                  [InlineKeyboardButton("🔙 برگشت",callback_data="back_main")]]
+        await query.edit_message_text("⏱ بازه ارسال خودکار:",reply_markup=InlineKeyboardMarkup(keyboard)); return
 
     if data.startswith("setint_"):
-        mins = int(data[7:]); user_data[chat_id]["interval"] = mins; save_data()
-        schedule_user_job(context.application, chat_id)
-        t, m = main_menu(chat_id)
-        await query.edit_message_text(f"✅ بازه ارسال روی {mins} دقیقه تنظیم شد.\n\n" + t, reply_markup=m); return
+        mins=int(data[7:]); user_data[chat_id]["interval"]=mins; save_data()
+        schedule_user_job(context.application,chat_id)
+        t,m=main_menu(chat_id); await query.edit_message_text(f"✅ بازه ارسال {mins} دقیقه.\n\n"+t,reply_markup=m); return
 
-    if data == "back_main":
-        t, m = main_menu(chat_id); await query.edit_message_text(t, reply_markup=m); return
+    if data=="back_main":
+        t,m=main_menu(chat_id); await query.edit_message_text(t,reply_markup=m); return
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    text    = update.message.text or ""
-    state   = user_states.get(chat_id)
+    chat_id=str(update.effective_chat.id); text=update.message.text or ""; state=user_states.get(chat_id)
 
-    if state == "waiting_price_symbol":
-        user_states.pop(chat_id, None)
-        sym = text.strip().upper()
-        if not sym.endswith("USDT"): sym += "USDT"
-        ticker = await get_ticker(sym)
-        await update.message.reply_text(build_price_message(sym, ticker)); return
+    if state=="waiting_price_symbol":
+        user_states.pop(chat_id,None); sym=text.strip().upper()
+        if not sym.endswith("USDT"): sym+="USDT"
+        ticker=await get_ticker(sym)
+        await update.message.reply_text(build_price_message(sym,ticker)); return
 
-    if state == "waiting_capital":
-        user_states.pop(chat_id, None)
+    if state=="waiting_capital":
+        user_states.pop(chat_id,None)
         try:
-            capital = float(text.strip().replace(",", "").replace("$", ""))
-            if capital <= 0: raise ValueError
-            user_data[chat_id]["capital"] = capital; save_data()
-            t, m = main_menu(chat_id)
-            await update.message.reply_text(
-                f"✅ سرمایه ${capital:,.0f} ثبت شد!\n\n"
-                f"از این به بعد موقع تحلیل، حجم، ریسک و اهرم مناسب پیشنهاد میدم.\n\n" + t,
-                reply_markup=m
-            )
-        except:
-            await update.message.reply_text("❌ مقدار وارد شده معتبر نیست. عدد دلاری بنویس (مثلاً: 1000)")
+            capital=float(text.strip().replace(",","").replace("$",""))
+            if capital<=0: raise ValueError
+            user_data[chat_id]["capital"]=capital; save_data()
+            t,m=main_menu(chat_id)
+            await update.message.reply_text(f"✅ سرمایه ${capital:,.0f} ثبت شد!\n\n"+t,reply_markup=m)
+        except: await update.message.reply_text("❌ مقدار معتبر نیست. عدد دلاری بنویس (مثلاً: 1000)")
         return
 
     if state and state.startswith("waiting_alert_"):
-        sym = state[14:]; user_states.pop(chat_id, None)
+        sym=state[14:]; user_states.pop(chat_id,None)
         try:
-            parts  = text.strip().lower().split()
-            alerts = user_data[chat_id].setdefault("price_alerts", {}).setdefault(sym, {})
+            parts=text.strip().lower().split()
+            alerts=user_data[chat_id].setdefault("price_alerts",{}).setdefault(sym,{})
             for part in parts:
-                if "above=" in part:
-                    alerts["above"] = float(part.split("=")[1])
-                elif "below=" in part:
-                    alerts["below"] = float(part.split("=")[1])
-            save_data()
-            t, m = alerts_menu(chat_id)
-            await update.message.reply_text(f"✅ هشدار برای {sym} ثبت شد!\n\n" + t, reply_markup=m)
-        except:
-            await update.message.reply_text("❌ فرمت اشتباه. مثال: above=50000 یا below=40000")
+                if "above=" in part: alerts["above"]=float(part.split("=")[1])
+                elif "below=" in part: alerts["below"]=float(part.split("=")[1])
+            save_data(); t,m=alerts_menu(chat_id)
+            await update.message.reply_text(f"✅ هشدار برای {sym} ثبت شد!\n\n"+t,reply_markup=m)
+        except: await update.message.reply_text("❌ فرمت اشتباه. مثال: above=50000 یا below=40000")
         return
 
-    if state == "waiting_custom_symbol":
-        user_states.pop(chat_id, None)
+    if state=="waiting_custom_symbol":
+        user_states.pop(chat_id,None)
         await update.message.reply_text("⏳ در حال بررسی ارز...")
-        valid = await validate_symbol(text.strip())
+        valid=await validate_symbol(text.strip())
         if valid:
             if valid not in user_data[chat_id]["symbols"]:
-                user_data[chat_id]["symbols"].append(valid); save_data()
-                schedule_user_job(context.application, chat_id)
-            t, m = main_menu(chat_id)
-            await update.message.reply_text(f"✅ {valid} اضافه شد!\n\n" + t, reply_markup=m)
-        else:
-            await update.message.reply_text(f"❌ ارز «{text}» پیدا نشد. دوباره امتحان کن.")
+                user_data[chat_id]["symbols"].append(valid); save_data(); schedule_user_job(context.application,chat_id)
+            t,m=main_menu(chat_id)
+            await update.message.reply_text(f"✅ {valid} اضافه شد!\n\n"+t,reply_markup=m)
+        else: await update.message.reply_text(f"❌ ارز «{text}» پیدا نشد.")
         return
 
-    me = await context.bot.get_me()
+    me=await context.bot.get_me()
     if me.username and f"@{me.username}" in text:
         init_user(chat_id)
         await update.message.reply_text("⏳ در حال تحلیل...")
-        await send_analysis(context.bot, chat_id, user_data[chat_id]["symbols"])
+        await send_analysis(context.bot,chat_id,user_data[chat_id]["symbols"])
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    user_states.pop(chat_id, None)
-    t, m = main_menu(chat_id)
-    await update.message.reply_text("لغو شد.\n\n" + t, reply_markup=m)
+    chat_id=str(update.effective_chat.id); user_states.pop(chat_id,None)
+    t,m=main_menu(chat_id); await update.message.reply_text("لغو شد.\n\n"+t,reply_markup=m)
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    backup_data()
-    await update.message.reply_text("✅ بکاپ ساخته شد")
+    backup_data(); await update.message.reply_text("✅ بکاپ ساخته شد")
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    if ADMIN_ID and chat_id != ADMIN_ID:
-        await update.message.reply_text("⛔ دسترسی ندارید")
-        return
-
-    ul = load_users_list()
-    if not ul:
-        await update.message.reply_text("📭 هنوز کاربری ثبت نشده")
-        return
-
-    total = len(ul)
-    msg   = f"👥 لیست کاربران ({total} نفر)\n"
-    msg  += f"━━━━━━━━━━━━━━━━━━━━\n\n"
-
-    for i, (cid, u) in enumerate(ul.items(), 1):
-        first  = datetime.fromisoformat(u["first_seen"]).strftime("%Y/%m/%d")
-        last   = datetime.fromisoformat(u["last_seen"]).strftime("%m/%d %H:%M")
-        name   = f"{u['first_name']} {u['last_name']}".strip() or "بدون نام"
-        msg   += (
-            f"{i}. {name}\n"
-            f"   🆔 {cid}\n"
-            f"   👤 {u['username']}\n"
-            f"   📅 عضو از: {first}  |  آخرین: {last}\n"
-            f"   🔢 تعداد start: {u['count']}\n\n"
-        )
-        if len(msg) > 3500 and i < total:
-            msg += f"... و {total - i} نفر دیگه\n"
-            break
-
+    chat_id=str(update.effective_chat.id)
+    if ADMIN_ID and chat_id!=ADMIN_ID:
+        await update.message.reply_text("⛔ دسترسی ندارید"); return
+    ul=load_users_list()
+    if not ul: await update.message.reply_text("📭 هنوز کاربری ثبت نشده"); return
+    total=len(ul); msg=f"👥 لیست کاربران ({total} نفر)\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    for i,(cid,u) in enumerate(ul.items(),1):
+        first=datetime.fromisoformat(u["first_seen"]).strftime("%Y/%m/%d")
+        last=datetime.fromisoformat(u["last_seen"]).strftime("%m/%d %H:%M")
+        name=f"{u['first_name']} {u['last_name']}".strip() or "بدون نام"
+        msg+=(f"{i}. {name}\n   🆔 {cid}\n   👤 {u['username']}\n"
+              f"   📅 عضو از: {first}  |  آخرین: {last}\n   🔢 start: {u['count']}\n\n")
+        if len(msg)>3500 and i<total: msg+=f"... و {total-i} نفر دیگه\n"; break
     await update.message.reply_text(msg)
 
 # =========================
@@ -1677,20 +2235,21 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 async def post_init(app: Application):
     global session
-    session = aiohttp.ClientSession()
-    scheduler.start()
-    load_data()
+    session=aiohttp.ClientSession()
+    scheduler.start(); load_data()
     for chat_id in user_data:
-        if user_data[chat_id].get("active", True):
-            try: schedule_user_job(app, chat_id)
+        if user_data[chat_id].get("active",True):
+            try: schedule_user_job(app,chat_id)
             except Exception as e: log.error(f"Schedule error {chat_id}: {e}")
-    scheduler.add_job(check_expired_positions, "interval", minutes=5,  args=[app.bot])
-    scheduler.add_job(check_price_alerts,      "interval", minutes=2,  args=[app.bot])
-    scheduler.add_job(backup_data,             "interval", minutes=10)
-    log.info("✅ Bot started successfully")
+    # job های سیستمی
+    scheduler.add_job(check_expired_positions,"interval",minutes=5,  args=[app.bot])
+    scheduler.add_job(check_price_alerts,     "interval",minutes=2,  args=[app.bot])
+    scheduler.add_job(check_auto_alerts,      "interval",minutes=30, args=[app.bot])  # آلرت خودکار هر ۳۰ دقیقه
+    scheduler.add_job(backup_data,            "interval",minutes=10)
+    log.info("✅ Bot v2.0 started — موتورهای تحلیل اختصاصی فعال")
 
 def main():
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app=Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("backup", backup_command))
@@ -1699,5 +2258,5 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.run_polling(drop_pending_updates=True)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
