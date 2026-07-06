@@ -32,12 +32,99 @@ if not TOKEN:
 DATA_FILE  = os.environ.get("DATA_FILE", "users_data.json")
 USERS_FILE = os.environ.get("USERS_FILE", "users_list.json")
 ADMIN_ID   = os.environ.get("ADMIN_ID", "")
+GROQ_API_KEY  = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL    = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+WEIGHTS_FILE = os.environ.get("WEIGHTS_FILE", "adaptive_weights.json")
+
+CACHE_TTL_SECONDS = 120  # ۲ دقیقه — طبق نیاز کش
 
 scheduler = AsyncIOScheduler()
 session = None
 user_data = {}
 user_jobs = {}
 user_states = {}
+adaptive_weights = {}   # امتیازدهی پویا: {symbol: {category: {"win":n,"loss":n}}}
+
+# =========================
+# CACHE (۲ دقیقه‌ای)
+# =========================
+_cache_store = {}   # key -> (timestamp, value)
+_cache_lock  = asyncio.Lock()
+
+async def cached_call(key, coro_factory, ttl=CACHE_TTL_SECONDS):
+    """
+    نتیجه هر تابع async رو تا ttl ثانیه کش می‌کنه تا سرعت بره بالا و
+    فشار روی صرافی‌ها (و ریسک بلاک IP) کم بشه.
+    """
+    now = datetime.now().timestamp()
+    async with _cache_lock:
+        hit = _cache_store.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    value = await coro_factory()
+    async with _cache_lock:
+        _cache_store[key] = (now, value)
+    return value
+
+def clear_expired_cache():
+    now = datetime.now().timestamp()
+    expired = [k for k, (ts, _) in _cache_store.items() if now - ts > CACHE_TTL_SECONDS * 3]
+    for k in expired: _cache_store.pop(k, None)
+
+# =========================
+# RATE LIMIT CONTROL — هر صرافی لیمیتر جدا داره
+# =========================
+class ExchangeRateLimiter:
+    """
+    جلوگیری از بلاک شدن IP: تعداد درخواست هم‌زمان و فاصله بین درخواست‌ها
+    برای هر صرافی جدا کنترل می‌شه.
+    """
+    def __init__(self, max_concurrent=5, min_interval=0.12):
+        self.sem = asyncio.Semaphore(max_concurrent)
+        self.min_interval = min_interval
+        self._last_call = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        await self.sem.acquire()
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            wait = self.min_interval - (now - self._last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_call = asyncio.get_event_loop().time()
+
+    def release(self):
+        self.sem.release()
+
+RATE_LIMITERS = {
+    "binance": ExchangeRateLimiter(max_concurrent=6, min_interval=0.10),
+    "mexc":    ExchangeRateLimiter(max_concurrent=4, min_interval=0.15),
+    "bybit":   ExchangeRateLimiter(max_concurrent=4, min_interval=0.15),
+    "kucoin":  ExchangeRateLimiter(max_concurrent=4, min_interval=0.15),
+    "toobit":  ExchangeRateLimiter(max_concurrent=3, min_interval=0.20),
+}
+
+async def throttled_get(exchange, url, timeout=15):
+    """درخواست GET با کنترل Rate Limit اختصاصی هر صرافی."""
+    limiter = RATE_LIMITERS.get(exchange)
+    if limiter: await limiter.acquire()
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+            status = r.status
+            if status == 429 or status == 418:
+                log.warning(f"⛔ Rate limit از {exchange} — عقب‌نشینی")
+                await asyncio.sleep(2.0)
+                return None, status
+            if status != 200:
+                return None, status
+            data = await r.json()
+            return data, status
+    except Exception as e:
+        log.warning(f"throttled_get [{exchange}] {url}: {e}")
+        return None, None
+    finally:
+        if limiter: limiter.release()
 
 AVAILABLE_SYMBOLS = [
     "BTCUSDT","ETHUSDT","SOLUSDT","AVAXUSDT","ADAUSDT","DOTUSDT","NEARUSDT",
@@ -207,16 +294,50 @@ async def _klines_kucoin(symbol, interval, limit):
             "volumes": np.array([float(c[5]) for c in rows]),
         }
 
-async def get_klines(symbol, interval="1h", limit=150):
+_TF_TOOBIT = {"1m":"1m","5m":"5m","15m":"15m","1h":"1h","4h":"4h","1d":"1d","1w":"1w"}
+
+async def _klines_toobit(symbol, interval, limit):
+    """Toobit از فرمت اسپات مشابه Binance استفاده می‌کنه"""
+    tf  = _TF_TOOBIT.get(interval, interval)
+    url = f"https://api.toobit.com/api/v1/quote/klines?symbol={symbol}&interval={tf}&limit={limit}"
+    limiter = RATE_LIMITERS["toobit"]; await limiter.acquire()
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200: return None
+            data = await r.json()
+            if not isinstance(data, list) or len(data) < 30: return None
+            return {
+                "closes":  np.array([float(c[4]) for c in data]),
+                "highs":   np.array([float(c[2]) for c in data]),
+                "lows":    np.array([float(c[3]) for c in data]),
+                "opens":   np.array([float(c[1]) for c in data]),
+                "volumes": np.array([float(c[5]) for c in data]),
+            }
+    except Exception as e:
+        log.warning(f"_klines_toobit {symbol}: {e}")
+        return None
+    finally:
+        limiter.release()
+
+async def _get_klines_uncached(symbol, interval="1h", limit=150):
     sources = [
         ("Binance", _klines_binance),
+        ("Toobit",  _klines_toobit),
         ("MEXC",    _klines_mexc),
         ("Bybit",   _klines_bybit),
         ("KuCoin",  _klines_kucoin),
     ]
     for name, fn in sources:
         try:
-            result = await fn(symbol, interval, limit)
+            limiter = RATE_LIMITERS.get(name.lower())
+            if name.lower() != "toobit":  # toobit خودش داخل تابعش acquire می‌کنه
+                if limiter: await limiter.acquire()
+                try:
+                    result = await fn(symbol, interval, limit)
+                finally:
+                    if limiter: limiter.release()
+            else:
+                result = await fn(symbol, interval, limit)
             if result is not None:
                 if name != "Binance":
                     log.info(f"klines {symbol}/{interval} از {name}")
@@ -224,6 +345,11 @@ async def get_klines(symbol, interval="1h", limit=150):
         except Exception as e:
             log.warning(f"get_klines [{name}] {symbol}/{interval}: {e}")
     return None
+
+async def get_klines(symbol, interval="1h", limit=150):
+    """کش ۲ دقیقه‌ای + fallback بین ۵ صرافی (Binance/Toobit/MEXC/Bybit/KuCoin)"""
+    key = f"klines:{symbol}:{interval}:{limit}"
+    return await cached_call(key, lambda: _get_klines_uncached(symbol, interval, limit))
 
 async def _ticker_binance(symbol):
     url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
@@ -267,16 +393,71 @@ async def _ticker_kucoin(symbol):
                 "high": float(t["high"] or price), "low": float(t["low"] or price),
                 "volume": float(t["vol"] or 0), "quote_volume": float(t["volValue"] or 0)}
 
-async def get_ticker(symbol):
-    for name, fn in [("Binance",_ticker_binance),("MEXC",_ticker_mexc),("Bybit",_ticker_bybit),("KuCoin",_ticker_kucoin)]:
+async def _ticker_toobit(symbol):
+    url = f"https://api.toobit.com/api/v1/quote/ticker/24hr?symbol={symbol}"
+    limiter = RATE_LIMITERS["toobit"]; await limiter.acquire()
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200: return None
+            d = await r.json()
+            if isinstance(d, list): d = d[0] if d else {}
+            if not d.get("lastPrice"): return None
+            return {"price": float(d["lastPrice"]), "change": float(d.get("priceChangePercent", 0)),
+                    "high": float(d.get("highPrice", d["lastPrice"])), "low": float(d.get("lowPrice", d["lastPrice"])),
+                    "volume": float(d.get("volume", 0)), "quote_volume": float(d.get("quoteVolume", 0))}
+    except Exception as e:
+        log.warning(f"_ticker_toobit {symbol}: {e}")
+        return None
+    finally:
+        limiter.release()
+
+async def _get_ticker_uncached(symbol):
+    for name, fn in [("Binance",_ticker_binance),("Toobit",_ticker_toobit),
+                      ("MEXC",_ticker_mexc),("Bybit",_ticker_bybit),("KuCoin",_ticker_kucoin)]:
         try:
-            r = await fn(symbol)
+            limiter = RATE_LIMITERS.get(name.lower())
+            if name != "Toobit" and limiter: await limiter.acquire()
+            try:
+                r = await fn(symbol)
+            finally:
+                if name != "Toobit" and limiter: limiter.release()
             if r:
                 if name != "Binance": log.info(f"ticker {symbol} از {name}")
                 return r
         except Exception as e:
             log.warning(f"get_ticker [{name}] {symbol}: {e}")
     return None
+
+async def get_ticker(symbol):
+    """کش ۲ دقیقه‌ای برای قیمت لحظه‌ای"""
+    return await cached_call(f"ticker:{symbol}", lambda: _get_ticker_uncached(symbol))
+
+async def get_price_comparison(symbol):
+    """
+    مقایسه قیمت بین صرافی‌ها (به‌خصوص Toobit) — برای رفع اختلاف قیمت.
+    میانگین صرافی‌های مرجع رو به عنوان قیمت واقعی برمی‌گردونه.
+    """
+    async def _fetch():
+        names_fns = [("Binance",_ticker_binance),("Toobit",_ticker_toobit),
+                      ("MEXC",_ticker_mexc),("Bybit",_ticker_bybit),("KuCoin",_ticker_kucoin)]
+        prices = {}
+        for name, fn in names_fns:
+            try:
+                r = await fn(symbol)
+                if r and r.get("price"): prices[name] = r["price"]
+            except Exception:
+                pass
+        if not prices: return None
+        ref_prices = [p for n, p in prices.items() if n != "Toobit"]
+        avg_ref = sum(ref_prices)/len(ref_prices) if ref_prices else None
+        toobit_p = prices.get("Toobit")
+        spread_pct = None
+        if toobit_p and avg_ref:
+            spread_pct = round((toobit_p - avg_ref) / avg_ref * 100, 3)
+        return {"prices": prices, "avg_reference": round(avg_ref, 6) if avg_ref else None,
+                "toobit_price": toobit_p, "toobit_spread_pct": spread_pct,
+                "toobit_warning": bool(spread_pct is not None and abs(spread_pct) > 0.3)}
+    return await cached_call(f"pricecmp:{symbol}", _fetch)
 
 async def validate_symbol(symbol):
     symbol = symbol.upper()
@@ -301,19 +482,197 @@ async def get_fear_greed():
         log.warning(f"Fear&Greed: {e}")
         return None
 
-async def get_funding_rate(symbol):
-    """Funding Rate از Binance فیوچرز"""
+async def _get_funding_rate_uncached(symbol):
     try:
         sym = symbol.replace("USDT", "") + "USDT"
         url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
-            if r.status != 200: return None
-            d = await r.json()
-            fr = float(d.get("lastFundingRate", 0)) * 100
-            return {"rate": round(fr, 4), "bullish": fr < 0, "extreme": abs(fr) > 0.1}
+        data, status = await throttled_get("binance", url, timeout=8)
+        if not data: return None
+        fr = float(data.get("lastFundingRate", 0)) * 100
+        return {"rate": round(fr, 4), "bullish": fr < 0, "extreme": abs(fr) > 0.1}
     except Exception as e:
         log.warning(f"FundingRate {symbol}: {e}")
         return None
+
+async def get_funding_rate(symbol):
+    return await cached_call(f"funding:{symbol}", lambda: _get_funding_rate_uncached(symbol))
+
+# =========================
+# FUTURES-SPECIFIC DATA (فیوچرز اختصاصی)
+# منبع: Binance USDS-M Futures API (fapi) — رایگان و بدون نیاز به کلید
+# =========================
+
+async def _get_open_interest_uncached(symbol):
+    """Open Interest فعلی + تغییرات نسبت به ۶ ساعت قبل"""
+    try:
+        sym = symbol.replace("USDT", "") + "USDT"
+        url_now  = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={sym}"
+        url_hist = (f"https://fapi.binance.com/futures/data/openInterestHist"
+                    f"?symbol={sym}&period=1h&limit=6")
+        now_d, _  = await throttled_get("binance", url_now, timeout=8)
+        hist_d, _ = await throttled_get("binance", url_hist, timeout=8)
+        if not now_d: return None
+        oi_now = float(now_d.get("openInterest", 0))
+        change_pct = None
+        if hist_d and len(hist_d) >= 2:
+            oi_old = float(hist_d[0].get("sumOpenInterest", oi_now))
+            if oi_old > 0:
+                change_pct = round((oi_now - oi_old) / oi_old * 100, 2)
+        return {"oi": oi_now, "change_pct": change_pct,
+                "rising": bool(change_pct is not None and change_pct > 2),
+                "falling": bool(change_pct is not None and change_pct < -2)}
+    except Exception as e:
+        log.warning(f"OpenInterest {symbol}: {e}")
+        return None
+
+async def get_open_interest(symbol):
+    return await cached_call(f"oi:{symbol}", lambda: _get_open_interest_uncached(symbol))
+
+async def _get_long_short_ratio_uncached(symbol):
+    """نسبت حساب‌های Long به Short (Global Account Ratio) — Binance"""
+    try:
+        sym = symbol.replace("USDT", "") + "USDT"
+        url = (f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
+               f"?symbol={sym}&period=1h&limit=1")
+        data, _ = await throttled_get("binance", url, timeout=8)
+        if not data: return None
+        row = data[-1]
+        long_pct  = float(row.get("longAccount", 0.5)) * 100
+        short_pct = float(row.get("shortAccount", 0.5)) * 100
+        ratio     = float(row.get("longShortRatio", 1.0))
+        # اکستریم بودن یعنی احتمال اسکوییز مخالف جهت اکثریت
+        extreme = ratio > 2.5 or ratio < 0.4
+        return {"long_pct": round(long_pct, 1), "short_pct": round(short_pct, 1),
+                "ratio": round(ratio, 2), "extreme": extreme,
+                "crowd": "long" if ratio > 1 else "short"}
+    except Exception as e:
+        log.warning(f"LongShortRatio {symbol}: {e}")
+        return None
+
+async def get_long_short_ratio(symbol):
+    return await cached_call(f"lsr:{symbol}", lambda: _get_long_short_ratio_uncached(symbol))
+
+async def _get_orderbook_imbalance_uncached(symbol, depth=50):
+    """عدم تعادل اردربوک — نسبت حجم بید به آسک در N سطح اول"""
+    try:
+        sym = symbol.replace("USDT", "") + "USDT"
+        url = f"https://fapi.binance.com/fapi/v1/depth?symbol={sym}&limit={depth}"
+        data, _ = await throttled_get("binance", url, timeout=8)
+        if not data: return None
+        bids = data.get("bids", []); asks = data.get("asks", [])
+        bid_vol = sum(float(b[1]) for b in bids)
+        ask_vol = sum(float(a[1]) for a in asks)
+        total = bid_vol + ask_vol
+        if total <= 0: return None
+        imbalance_pct = round((bid_vol - ask_vol) / total * 100, 2)
+        if imbalance_pct > 20:    bias = "strong_bid"
+        elif imbalance_pct > 8:   bias = "bid"
+        elif imbalance_pct < -20: bias = "strong_ask"
+        elif imbalance_pct < -8:  bias = "ask"
+        else:                     bias = "balanced"
+        return {"bid_vol": round(bid_vol, 2), "ask_vol": round(ask_vol, 2),
+                "imbalance_pct": imbalance_pct, "bias": bias}
+    except Exception as e:
+        log.warning(f"OrderBookImbalance {symbol}: {e}")
+        return None
+
+async def get_orderbook_imbalance(symbol):
+    return await cached_call(f"obi:{symbol}", lambda: _get_orderbook_imbalance_uncached(symbol))
+
+async def _get_cvd_uncached(symbol, limit=1000):
+    """
+    CVD واقعی (Cumulative Volume Delta) از معاملات فیوچرز اخیر Binance:
+    هر ترید با isBuyerMaker=False یعنی خریدار تهاجمی بوده (تیکر بازار).
+    """
+    try:
+        sym = symbol.replace("USDT", "") + "USDT"
+        url = f"https://fapi.binance.com/fapi/v1/aggTrades?symbol={sym}&limit={limit}"
+        data, _ = await throttled_get("binance", url, timeout=10)
+        if not data: return None
+        delta = 0.0; buy_vol = 0.0; sell_vol = 0.0
+        for t in data:
+            qty = float(t["q"])
+            if t.get("m") is False:   # buyer aggressive (isBuyerMaker=False)
+                buy_vol += qty; delta += qty
+            else:
+                sell_vol += qty; delta -= qty
+        total = buy_vol + sell_vol
+        strength = abs(delta) / total if total > 0 else 0
+        bias = "bullish" if delta > 0 else ("bearish" if delta < 0 else "neutral")
+        imbalance = "strong_bullish" if strength > 0.25 and bias == "bullish" else \
+                    ("strong_bearish" if strength > 0.25 and bias == "bearish" else bias)
+        return {"cvd": round(delta, 2), "buy_vol": round(buy_vol, 2), "sell_vol": round(sell_vol, 2),
+                "bias": bias, "imbalance": imbalance, "strength": round(strength, 3)}
+    except Exception as e:
+        log.warning(f"CVD {symbol}: {e}")
+        return None
+
+async def get_cvd(symbol):
+    return await cached_call(f"cvd:{symbol}", lambda: _get_cvd_uncached(symbol))
+
+async def _get_liquidation_heatmap_uncached(symbol):
+    """
+    نقشه حرارتی لیکوئیدیشن — تخمینی.
+    ⚠️ داده لیکوئیدیشن زنده و دقیق (مثل Coinglass) نیاز به API پولی داره.
+    این تابع با ترکیب Open Interest بالا + Funding Rate افراطی + سطوح حجمی (POC/VA)
+    نواحی احتمالی تجمع لیکوئیدیشن رو تخمین می‌زنه — نه داده واقعی صرافی.
+    """
+    try:
+        ticker = await get_ticker(symbol)
+        oi     = await get_open_interest(symbol)
+        fr     = await get_funding_rate(symbol)
+        if not ticker: return None
+        price = ticker["price"]
+        # هرچه Funding مثبت‌تر/منفی‌تر و OI بالاتر باشه، لیکوئیدیشن احتمالی نزدیک‌تره
+        lev_zone_pct = 0.5 if (fr and fr.get("extreme")) else 1.2
+        long_liq_zone  = round(price * (1 - lev_zone_pct/100 * 3), 6)   # لیکوئید لانگ‌ها زیر قیمت
+        short_liq_zone = round(price * (1 + lev_zone_pct/100 * 3), 6)   # لیکوئید شورت‌ها بالای قیمت
+        crowd = "long" if (fr and fr["rate"] > 0) else "short"
+        return {
+            "estimated": True,
+            "long_liq_zone": long_liq_zone, "short_liq_zone": short_liq_zone,
+            "crowded_side": crowd,
+            "note": "تخمینی بر اساس OI و Funding — نه داده مستقیم صرافی"
+        }
+    except Exception as e:
+        log.warning(f"LiquidationHeatmap {symbol}: {e}")
+        return None
+
+async def get_liquidation_heatmap(symbol):
+    return await cached_call(f"liqmap:{symbol}", lambda: _get_liquidation_heatmap_uncached(symbol))
+
+async def _get_news_sentiment_uncached(symbol):
+    """
+    تحلیل فاندامنتال اخبار فوری — از CryptoCompare News (رایگان)
+    امتیازدهی ساده بر اساس کلیدواژه‌های مثبت/منفی در تیتر اخبار اخیر.
+    """
+    try:
+        coin = symbol.replace("USDT", "")
+        url  = f"https://min-api.cryptocompare.com/data/v2/news/?categories={coin}&lang=EN"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200: return None
+            d = await r.json()
+        articles = d.get("Data", [])[:15]
+        if not articles: return None
+        pos_kw = ["surge","rally","bullish","approval","partnership","upgrade","adoption",
+                  "record high","breakout","integrat","launch","etf approv","gain"]
+        neg_kw = ["hack","exploit","ban","lawsuit","crash","bearish","sec charges","delist",
+                  "outflow","dump","fraud","investigation","sell-off","collapse"]
+        score = 0; headlines = []
+        for a in articles:
+            title = (a.get("title") or "").lower()
+            s = sum(1 for k in pos_kw if k in title) - sum(1 for k in neg_kw if k in title)
+            score += s
+            if len(headlines) < 3 and s != 0:
+                headlines.append({"title": a.get("title"), "score": s, "url": a.get("url")})
+        label = "مثبت 🟢" if score > 1 else ("منفی 🔴" if score < -1 else "خنثی ⚪")
+        return {"score": score, "label": label, "sample": headlines, "count": len(articles)}
+    except Exception as e:
+        log.warning(f"NewsSentiment {symbol}: {e}")
+        return None
+
+async def get_news_sentiment(symbol):
+    return await cached_call(f"news:{symbol}", lambda: _get_news_sentiment_uncached(symbol), ttl=600)
 
 # =========================
 # INDICATORS
@@ -617,34 +976,43 @@ def calc_poc(highs, lows, closes, volumes, lookback=50, bins=20):
 # =========================
 # WHALE ALERT (on-chain بزرگ)
 # =========================
-async def get_whale_alerts(symbol):
+WHALE_NOTIONAL_USD = 100_000  # آستانه دلاری برای شناسایی معامله «نهنگ»
+
+async def _get_whale_alerts_uncached(symbol):
     """
-    تراکنش‌های بزرگ از whale-alert.io (API رایگان محدود)
-    fallback: از CryptoCompare آنچین چک می‌کنیم
+    ردیابی معاملات بزرگ (نهنگ) از روی aggTrades فیوچرز واقعی Binance.
+    ⚠️ این ردیابی حرکت‌های بزرگ داخل اردربوک صرافیه، نه رصد ولت‌های آنچین
+    (رصد واقعی ولت‌ها به سرویس پولی مثل Whale Alert / Arkham نیاز داره؛
+    این تابع جایگزین رایگان و قابل‌اتکایی برای فشار خرید/فروش نهنگ‌های صرافیه).
     """
     try:
-        coin = symbol.replace("USDT","").lower()
-        # از CryptoCompare برای تراکنش‌های بزرگ
-        url = f"https://min-api.cryptocompare.com/data/blockchain/histo/day?fsym={coin.upper()}&limit=1"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
-            if r.status != 200: return None
-            d = await r.json()
-            if d.get("Response") != "Success": return None
-            today = d["Data"]["Data"][-1] if d["Data"]["Data"] else {}
-            tx_count     = today.get("transaction_count", 0)
-            active_addr  = today.get("active_addresses", 0)
-            large_tx     = today.get("large_transaction_count", 0)
-            # نرمال‌سازی
-            return {
-                "large_tx":    large_tx,
-                "active_addr": active_addr,
-                "tx_count":    tx_count,
-                "bullish":     large_tx > 500 or active_addr > 100000,
-                "alert":       large_tx > 1000,
-            }
+        sym = symbol.replace("USDT", "") + "USDT"
+        url = f"https://fapi.binance.com/fapi/v1/aggTrades?symbol={sym}&limit=1000"
+        data, _ = await throttled_get("binance", url, timeout=10)
+        if not data: return None
+        big_buys = []; big_sells = []
+        for t in data:
+            price = float(t["p"]); qty = float(t["q"]); notional = price * qty
+            if notional >= WHALE_NOTIONAL_USD:
+                (big_sells if t.get("m") else big_buys).append(notional)
+        buy_usd  = sum(big_buys); sell_usd = sum(big_sells)
+        large_tx = len(big_buys) + len(big_sells)
+        net_bias = "bullish" if buy_usd > sell_usd * 1.3 else ("bearish" if sell_usd > buy_usd * 1.3 else "neutral")
+        return {
+            "large_tx":    large_tx,
+            "buy_usd":     round(buy_usd, 0),
+            "sell_usd":    round(sell_usd, 0),
+            "bullish":     net_bias == "bullish",
+            "bearish":     net_bias == "bearish",
+            "alert":       large_tx >= 5 and net_bias != "neutral",
+            "source":      "exchange_trades",  # نه آنچین واقعی
+        }
     except Exception as e:
         log.warning(f"WhaleAlert {symbol}: {e}")
         return None
+
+async def get_whale_alerts(symbol):
+    return await cached_call(f"whale:{symbol}", lambda: _get_whale_alerts_uncached(symbol))
 
 def detect_candle_patterns(opens, closes, highs, lows):
     patterns = []
@@ -1163,11 +1531,14 @@ async def analyze_timeframe(symbol, tf, limit, mode_key="short"):
     # از موتور مناسب استفاده کن
     engine = SCORE_ENGINES.get(mode_key, score_short)
     votes  = engine(ind, price)
+    weighted_votes = apply_dynamic_weights(symbol, votes)   # امتیازدهی پویا اعمال می‌شه
 
     return {
         "tf": tf,
         "votes": votes,
-        "score": sum(sc for _, sc in votes),
+        "weighted_votes": weighted_votes,
+        "categories": sorted(set(c for _, _, c in weighted_votes)),
+        "score": round(sum(sc for _, sc, _ in weighted_votes), 3),
         "indicators": ind
     }
 
@@ -1182,18 +1553,41 @@ async def full_analysis(symbol, mode_key="short"):
     price = ticker["price"]
 
     tasks = [analyze_timeframe(symbol, tf, mode["kline_limit"], mode_key) for tf in mode["timeframes"]]
-    raw_results = await asyncio.gather(*tasks)
+    futures_tasks = [get_funding_rate(symbol), get_open_interest(symbol),
+                      get_long_short_ratio(symbol), get_orderbook_imbalance(symbol), get_cvd(symbol)]
+    raw_results, fr_d, oi_d, lsr_d, obi_d, cvd_d = await asyncio.gather(*tasks, *futures_tasks)
 
-    tf_results = {}; total_score = 0; all_reasons = []
+    tf_results = {}; total_score = 0; all_reasons = []; all_categories = set()
 
     for tf, result in zip(mode["timeframes"], raw_results):
         if not result: continue
         w = mode["weights"].get(tf, 1)
         total_score += result["score"] * w
         tf_results[tf] = result
-        if w >= 2:
-            for reason, vote in result["votes"]:
-                if abs(vote) >= 2: all_reasons.append(f"{reason} ({tf})")
+        all_categories.update(result.get("categories", []))
+        for reason, vote in result["votes"]:
+            if abs(vote) >= 2: all_reasons.append(f"{reason} ({tf})")
+
+    # امتیاز اضافه از دیتای اختصاصی فیوچرز (Funding/OI/LSR/OBI/CVD)
+    futures_score = 0
+    if fr_d and fr_d.get("extreme"):
+        futures_score += 2 if fr_d["bullish"] else -2
+        all_reasons.append(f"Funding Rate افراطی ({fr_d['rate']}%)")
+    if oi_d:
+        if oi_d.get("rising") and total_score > 0: futures_score += 1
+        elif oi_d.get("rising") and total_score < 0: futures_score -= 1
+    if lsr_d and lsr_d.get("extreme"):
+        # اکثریت شدید یک سمت → احتمال اسکوییز در جهت مخالف جمع
+        futures_score += -1.5 if lsr_d["crowd"] == "long" else 1.5
+        all_reasons.append(f"ازدحام {('لانگ' if lsr_d['crowd']=='long' else 'شورت')} — ریسک اسکوییز مخالف")
+    if obi_d and obi_d["bias"] in ("strong_bid", "strong_ask"):
+        futures_score += 1.5 if obi_d["bias"] == "strong_bid" else -1.5
+        all_reasons.append(f"عدم تعادل اردربوک: {obi_d['bias']}")
+    if cvd_d and cvd_d.get("imbalance") in ("strong_bullish", "strong_bearish"):
+        futures_score += 2 if cvd_d["imbalance"] == "strong_bullish" else -2
+        all_reasons.append(f"CVD: {cvd_d['imbalance']}")
+
+    total_score += futures_score
 
     tf_dirs = []
     for tf, result in tf_results.items():
@@ -1269,6 +1663,8 @@ async def full_analysis(symbol, mode_key="short"):
         "is_ranging": is_ranging,
         "volume_ok": volume_ok,
         "tf_agreement": {"bullish": bullish_c, "bearish": bearish_c, "neutral": tf_dirs.count(0)},
+        "futures_data": {"funding": fr_d, "oi": oi_d, "lsr": lsr_d, "obi": obi_d, "cvd": cvd_d},
+        "categories_used": sorted(all_categories),
     }
 
 # =========================
@@ -1438,6 +1834,164 @@ def build_mm_section(capital, analysis):
     return msg
 
 # =========================
+# DYNAMIC SCORING (امتیازدهی پویا)
+# اگر یک اندیکاتور روی یک ارز خاص نتیجه خوبی داده، وزنش بالاتر می‌ره
+# =========================
+CATEGORY_KEYWORDS = {
+    "RSI": ["RSI", "rsi"], "MACD": ["MACD"], "BB": ["BB", "باند"],
+    "Stoch": ["استوک", "Stoch"], "ADX": ["ADX", "روند"], "Ichimoku": ["ایچیموکو"],
+    "Volume": ["حجم"], "OrderFlow": ["Order Flow"], "FVG": ["FVG"],
+    "POC": ["POC", "Value Area"], "Divergence": ["واگرایی"], "EMA": ["EMA", "Golden", "Death"],
+    "MarketStructure": ["ساختار", "BOS"], "VWAP": ["VWAP"], "Pattern": ["الگو"],
+}
+
+def _categorize_reason(reason):
+    for cat, kws in CATEGORY_KEYWORDS.items():
+        if any(kw in reason for kw in kws): return cat
+    return "Other"
+
+def load_adaptive_weights():
+    global adaptive_weights
+    if os.path.exists(WEIGHTS_FILE):
+        try:
+            with open(WEIGHTS_FILE, "r", encoding="utf-8") as f: adaptive_weights = json.load(f)
+        except Exception as e:
+            log.error(f"load_adaptive_weights: {e}"); adaptive_weights = {}
+
+def save_adaptive_weights():
+    try:
+        tmp = WEIGHTS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f: json.dump(adaptive_weights, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, WEIGHTS_FILE)
+    except Exception as e:
+        log.error(f"save_adaptive_weights: {e}")
+
+def get_category_multiplier(symbol, category):
+    """
+    وزن اکتسابی: بین 0.6x (اندیکاتور ضعیف روی این ارز) تا 1.5x (اندیکاتور قوی روی این ارز)
+    بر اساس نرخ موفقیت تاریخی محاسبه می‌شه. حداقل ۵ نمونه لازمه تا اثر بذاره.
+    """
+    stat = adaptive_weights.get(symbol, {}).get(category)
+    if not stat: return 1.0
+    total = stat.get("win", 0) + stat.get("loss", 0)
+    if total < 5: return 1.0
+    win_rate = stat["win"] / total
+    return round(0.6 + win_rate * 0.9, 3)   # win_rate=0 -> 0.6x | win_rate=1 -> 1.5x
+
+def apply_dynamic_weights(symbol, votes):
+    """روی لیست votes یک اندیکاتور، ضریب یادگرفته‌شده رو اعمال می‌کنه"""
+    adjusted = []
+    for reason, score in votes:
+        cat  = _categorize_reason(reason)
+        mult = get_category_multiplier(symbol, cat)
+        adjusted.append((reason, round(score * mult, 3), cat))
+    return adjusted
+
+def update_indicator_performance(symbol, categories_used, outcome_is_win):
+    """بعد از بسته شدن هر پوزیشن، امتیاز اندیکاتورهایی که در اون سیگنال شرکت داشتن آپدیت می‌شه"""
+    sym_w = adaptive_weights.setdefault(symbol, {})
+    for cat in categories_used:
+        stat = sym_w.setdefault(cat, {"win": 0, "loss": 0})
+        if outcome_is_win: stat["win"] += 1
+        else: stat["loss"] += 1
+    save_adaptive_weights()
+
+# =========================
+# AI SIGNAL EXPLANATION (هوش مصنوعی صادرکننده سیگنال)
+# =========================
+async def get_ai_explanation(analysis, futures_data=None, news=None):
+    """
+    از Groq API (مدل‌های سریع مثل Llama 3.3) برای تولید توضیح کامل و روان سیگنال استفاده می‌کنه.
+    اگر GROQ_API_KEY تنظیم نشده باشه یا خطا بده، توضیح قانون‌محور جایگزین می‌شه
+    (هسته سیگنال هرگز به AI وابسته نیست).
+    """
+    if not analysis or analysis["direction"] == "NEUTRAL ⚪": return None
+    if not GROQ_API_KEY:
+        return _fallback_explanation(analysis, futures_data, news)
+    try:
+        summary = {
+            "symbol": analysis["symbol"], "direction": analysis["direction"],
+            "score": analysis["score"], "agreement": analysis["agreement"],
+            "confidence": analysis["confidence"], "reasons": analysis["reasons"],
+            "mode": analysis["mode_label"],
+            "funding_rate": futures_data.get("funding") if futures_data else None,
+            "open_interest_change": futures_data.get("oi") if futures_data else None,
+            "long_short_ratio": futures_data.get("lsr") if futures_data else None,
+            "cvd": futures_data.get("cvd") if futures_data else None,
+            "orderbook_imbalance": futures_data.get("obi") if futures_data else None,
+            "news_sentiment": news.get("label") if news else None,
+        }
+        prompt = (
+            "تو یک تحلیلگر ارشد فیوچرز کریپتو هستی. بر اساس دیتای زیر، در ۳ تا ۵ جمله فارسی روان "
+            "توضیح بده چرا این سیگنال صادر شده و چه ریسکی داره. مختصر و حرفه‌ای بنویس، بدون تیتر یا مقدمه:\n\n"
+            f"{json.dumps(summary, ensure_ascii=False)}"
+        )
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        body = {"model": GROQ_MODEL, "max_tokens": 400, "temperature": 0.4,
+                "messages": [{"role": "user", "content": prompt}]}
+        async with session.post(url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status != 200:
+                log.warning(f"Groq API status {r.status}: {await r.text()}")
+                return _fallback_explanation(analysis, futures_data, news)
+            d = await r.json()
+            text = (d.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            return text if text else _fallback_explanation(analysis, futures_data, news)
+    except Exception as e:
+        log.warning(f"AI explanation error: {e}")
+        return _fallback_explanation(analysis, futures_data, news)
+
+def _fallback_explanation(analysis, futures_data=None, news=None):
+    """توضیح قانون‌محور وقتی AI در دسترس نیست — هسته سیگنال هیچ‌وقت قطع نمی‌شه"""
+    parts = []
+    d = "صعودی" if "LONG" in analysis["direction"] else "نزولی"
+    parts.append(f"سیگنال {d} با امتیاز {analysis['score']} و هم‌راستایی {analysis['agreement']}٪ بین تایم‌فریم‌ها صادر شده.")
+    if analysis["reasons"]:
+        parts.append("مهم‌ترین دلایل: " + "، ".join(analysis["reasons"][:3]) + ".")
+    if futures_data:
+        fr = futures_data.get("funding")
+        if fr and fr.get("extreme"):
+            parts.append(f"Funding Rate در ناحیه افراطی ({fr['rate']}%) قرار داره که احتمال اسکوییز رو بالا می‌بره.")
+        lsr = futures_data.get("lsr")
+        if lsr and lsr.get("extreme"):
+            parts.append(f"اکثریت معامله‌گران سمت {lsr['crowd']} هستن که ریسک نقدشدن دسته‌جمعی مخالف جهت جمع رو ایجاد می‌کنه.")
+    if news and news.get("label") and "خنثی" not in news["label"]:
+        parts.append(f"اخبار اخیر بازار {news['label']} ارزیابی شده.")
+    parts.append("⚠️ این یک تحلیل خودکاره و جایگزین تصمیم شخصی و مدیریت ریسک خودت نیست.")
+    return " ".join(parts)
+
+# =========================
+# NEW/HOT COIN SCANNER (اسکن ارزهای جدید و پرنوسان)
+# =========================
+async def scan_hot_coins(top_n=8):
+    """
+    اسکن آلت‌کوین‌های پرنوسان بر اساس تغییر قیمت ۲۴h و جهش حجم غیرعادی روی فیوچرز Binance.
+    ⚠️ این روش نشانگر «نوسان بالا» ست، نه تشخیص قطعی لیست جدید صرافی
+    (تاریخ لیست‌شدن دقیق نیاز به endpoint اختصاصی هر صرافیه که رایگان در دسترس نیست).
+    """
+    try:
+        url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+        data, _ = await throttled_get("binance", url, timeout=15)
+        if not data: return []
+        candidates = []
+        for d in data:
+            sym = d.get("symbol", "")
+            if not sym.endswith("USDT"): continue
+            try:
+                change = abs(float(d.get("priceChangePercent", 0)))
+                qvol   = float(d.get("quoteVolume", 0))
+            except Exception:
+                continue
+            if qvol < 3_000_000: continue  # حذف ارزهای بی‌نقدینگی
+            if change >= 8:
+                candidates.append({"symbol": sym, "change_pct": round(change, 2), "quote_volume": round(qvol, 0)})
+        candidates.sort(key=lambda x: x["change_pct"], reverse=True)
+        return candidates[:top_n]
+    except Exception as e:
+        log.warning(f"scan_hot_coins: {e}")
+        return []
+
+# =========================
 # DATA
 # =========================
 def load_data():
@@ -1506,12 +2060,16 @@ def format_price(p):
 # =========================
 # MESSAGE BUILDERS
 # =========================
-def build_analysis_message(a, capital=None, fg=None, fr=None, whale=None):
+def build_analysis_message(a, capital=None, fg=None, fr=None, whale=None,
+                            news=None, price_cmp=None, liq_map=None, ai_explanation=None):
     if not a: return "❌ خطا در دریافت داده"
     sym = a["symbol"]
     tv  = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}"
     now = datetime.now().strftime("%H:%M:%S")
     agg = a["tf_agreement"]
+    fd  = a.get("futures_data", {}) or {}
+    if fr is None: fr = fd.get("funding")
+    oi  = fd.get("oi"); lsr = fd.get("lsr"); obi = fd.get("obi"); cvd = fd.get("cvd")
 
     msg  = f"━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"📊 {sym} | {now}\n"
@@ -1520,14 +2078,34 @@ def build_analysis_message(a, capital=None, fg=None, fr=None, whale=None):
     msg += f"📈 تغییر ۲۴h: {a['ticker']['change']:+.2f}%\n"
     msg += f"🕐 بازه: {a['mode_label']}\n"
 
+    if price_cmp and price_cmp.get("toobit_warning"):
+        msg += f"⚠️ اختلاف قیمت Toobit: {price_cmp['toobit_spread_pct']:+.2f}٪ نسبت به میانگین صرافی‌ها\n"
+
     if fg:
         msg += f"😱 Fear&Greed: {fg['value']} — {fg['label']} {fg['emoji']}\n"
     if fr:
         fr_emoji = "🟢" if fr["bullish"] else "🔴"
         fr_warn  = " ⚠️ افراطی!" if fr["extreme"] else ""
         msg += f"{fr_emoji} Funding Rate: {fr['rate']}%{fr_warn}\n"
+    if oi and oi.get("change_pct") is not None:
+        oi_emoji = "📈" if oi["rising"] else ("📉" if oi["falling"] else "➖")
+        msg += f"{oi_emoji} Open Interest: {oi['change_pct']:+.2f}٪ (۶ساعته)\n"
+    if lsr:
+        lsr_warn = " ⚠️ ازدحام!" if lsr["extreme"] else ""
+        msg += f"⚖️ Long/Short: {lsr['long_pct']}٪ / {lsr['short_pct']}٪{lsr_warn}\n"
+    if obi and obi["bias"] != "balanced":
+        obi_emoji = "🟢" if "bid" in obi["bias"] else "🔴"
+        msg += f"{obi_emoji} Order Book Imbalance: {obi['imbalance_pct']:+.1f}٪ ({obi['bias']})\n"
+    if cvd and cvd.get("imbalance") in ("strong_bullish", "strong_bearish"):
+        cvd_emoji = "🟢" if cvd["imbalance"] == "strong_bullish" else "🔴"
+        msg += f"{cvd_emoji} CVD: {cvd['imbalance']} (قدرت: {cvd['strength']})\n"
+    if liq_map:
+        msg += f"🗺 لیکوئیدیشن تخمینی: پایین {format_price(liq_map['long_liq_zone'])} | بالا {format_price(liq_map['short_liq_zone'])}\n"
+    if news and news.get("label") and "خنثی" not in news["label"]:
+        msg += f"📰 اخبار: {news['label']}\n"
     if whale and whale.get("alert"):
-        msg += f"🐋 Whale Alert: {whale.get('large_tx',0)} تراکنش بزرگ!\n"
+        w_emoji = "🟢" if whale.get("bullish") else ("🔴" if whale.get("bearish") else "🐋")
+        msg += f"{w_emoji} فشار نهنگ‌ها: {whale.get('large_tx',0)} معامله بزرگ (خرید ${whale.get('buy_usd',0):,.0f} / فروش ${whale.get('sell_usd',0):,.0f})\n"
 
     msg += f"\n🎯 سیگنال: {a['direction']}\n"
     msg += f"💪 اطمینان: {a['confidence']}\n"
@@ -1602,6 +2180,9 @@ def build_analysis_message(a, capital=None, fg=None, fr=None, whale=None):
         if of_d and of_d.get("imbalance") in ("strong_bullish","strong_bearish"):
             of_emoji = "🟢" if of_d["bias"]=="bullish" else "🔴"
             msg += f"  {of_emoji} Order Flow: {of_d['imbalance']} (قدرت: {of_d['strength']}x)\n"
+
+    if ai_explanation:
+        msg += f"\n🤖 توضیح هوش مصنوعی:\n{ai_explanation}\n"
 
     msg += f"\n🔗 {tv}\n━━━━━━━━━━━━━━━━━━━━"
     return msg
@@ -1701,7 +2282,8 @@ def main_menu(chat_id):
          InlineKeyboardButton("🏆 عملکرد", callback_data="menu_performance")],
         [InlineKeyboardButton("🧪 بک‌تست", callback_data="menu_backtest"),
          InlineKeyboardButton("🐋 نهنگ‌ها", callback_data="menu_whale")],
-        [InlineKeyboardButton("⏱ بازه ارسال", callback_data="menu_interval")],
+        [InlineKeyboardButton("🆕 ارزهای داغ", callback_data="menu_hotcoins"),
+         InlineKeyboardButton("⏱ بازه ارسال", callback_data="menu_interval")],
     ]
     status = "🟢 فعال" if is_active else "🔴 متوقف"
     text = (f"🤖 ربات تحلیل ارز دیجیتال\n━━━━━━━━━━━━━━━\n"
@@ -1769,59 +2351,66 @@ def alerts_menu(chat_id):
 # SMART AUTO ALERT
 # =========================
 async def check_auto_alerts(bot):
-    """بررسی خودکار سیگنال‌های قوی و ارسال Alert"""
-    for chat_id, udata in list(user_data.items()):
-        if not udata.get("auto_alert_enabled", True): continue
-        if not udata.get("active", True): continue
-        symbols   = udata.get("symbols", [])
-        mode_key  = udata.get("trading_mode", "short")
-        threshold = udata.get("auto_alert_threshold", 8)
-        capital   = udata.get("capital")
+    """
+    هسته آلرت خودکار — کاملاً مستقل از هسته پوزیشن (check_expired_positions).
+    این تابع هرگز نباید به‌خاطر خطا در بخش دیگه‌ای از ربات متوقف بشه؛ هر
+    خطا فقط برای همون symbol/user لاگ می‌شه و بقیه ادامه پیدا می‌کنن.
+    """
+    try:
+        for chat_id, udata in list(user_data.items()):
+            if not udata.get("auto_alert_enabled", True): continue
+            if not udata.get("active", True): continue
+            symbols   = udata.get("symbols", [])
+            mode_key  = udata.get("trading_mode", "short")
+            threshold = udata.get("auto_alert_threshold", 8)
+            capital   = udata.get("capital")
 
-        for symbol in symbols:
-            try:
-                a = await full_analysis(symbol, mode_key)
-                if not a: continue
-                if a["direction"] == "NEUTRAL ⚪": continue
-                # فقط سیگنال‌های قوی
-                if abs(a["score"]) < threshold: continue
-                if a["agreement"] < 75: continue
+            for symbol in symbols:
+                try:
+                    a = await full_analysis(symbol, mode_key)
+                    if not a: continue
+                    if a["direction"] == "NEUTRAL ⚪": continue
+                    if abs(a["score"]) < threshold: continue
+                    if a["agreement"] < 75: continue
 
-                # چک کن آیا همین سیگنال رو قبلاً فرستادیم
-                last_alerts = udata.setdefault("last_auto_alerts", {})
-                last = last_alerts.get(symbol, {})
-                # اگر همین جهت رو در ۴ ساعت گذشته فرستادیم، نفرست
-                if last.get("direction") == a["direction"]:
-                    last_time = datetime.fromisoformat(last["time"])
-                    if datetime.now() - last_time < timedelta(hours=4): continue
+                    last_alerts = udata.setdefault("last_auto_alerts", {})
+                    last = last_alerts.get(symbol, {})
+                    if last.get("direction") == a["direction"]:
+                        last_time = datetime.fromisoformat(last["time"])
+                        if datetime.now() - last_time < timedelta(hours=4): continue
 
-                fg = await get_fear_greed()
-                fr = await get_funding_rate(symbol)
+                    fg   = await get_fear_greed()
+                    news = await get_news_sentiment(symbol)
+                    liq_map = await get_liquidation_heatmap(symbol)
+                    ai_expl = await get_ai_explanation(a, a.get("futures_data"), news)
 
-                msg  = f"🚨 آلرت خودکار — سیگنال قوی!\n"
-                msg += f"━━━━━━━━━━━━━━━━━━━━\n"
-                msg += build_analysis_message(a, capital, fg, fr)
+                    msg  = f"🚨 آلرت خودکار — سیگنال قوی!\n"
+                    msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+                    msg += build_analysis_message(a, capital, fg, None, None, news, None, liq_map, ai_expl)
 
-                await bot.send_message(chat_id=int(chat_id), text=msg, disable_web_page_preview=True)
+                    await bot.send_message(chat_id=int(chat_id), text=msg, disable_web_page_preview=True)
 
-                last_alerts[symbol] = {"direction": a["direction"], "time": datetime.now().isoformat()}
-                # ذخیره پوزیشن
-                if a["expiry"]:
-                    udata.setdefault("active_positions", {})[symbol] = {
-                        "direction": a["direction"], "entry": a["entry"],
-                        "stop_loss": a["stop_loss"], "tp1": a["tp1"], "expiry": a["expiry"],
-                    }
-                    stats = udata.setdefault("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
-                    stats["total"] += 1
-                    history = udata.setdefault("signal_history", [])
-                    history.append({"symbol": symbol, "direction": a["direction"], "entry": a["entry"],
-                                    "tp1": a["tp1"], "stop_loss": a["stop_loss"],
-                                    "time": datetime.now().isoformat(), "result": "در انتظار", "mode": mode_key})
-                    if len(history) > 200: udata["signal_history"] = history[-200:]
-                save_data()
-                await asyncio.sleep(1)
-            except Exception as e:
-                log.error(f"check_auto_alerts {chat_id}/{symbol}: {e}")
+                    last_alerts[symbol] = {"direction": a["direction"], "time": datetime.now().isoformat()}
+                    if a["expiry"]:
+                        udata.setdefault("active_positions", {})[symbol] = {
+                            "direction": a["direction"], "entry": a["entry"],
+                            "stop_loss": a["stop_loss"], "tp1": a["tp1"], "expiry": a["expiry"],
+                            "mode": mode_key, "categories_used": a.get("categories_used", []),
+                        }
+                        stats = udata.setdefault("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
+                        stats["total"] += 1
+                        history = udata.setdefault("signal_history", [])
+                        history.append({"symbol": symbol, "direction": a["direction"], "entry": a["entry"],
+                                        "tp1": a["tp1"], "stop_loss": a["stop_loss"],
+                                        "time": datetime.now().isoformat(), "result": "در انتظار", "mode": mode_key})
+                        if len(history) > 200: udata["signal_history"] = history[-200:]
+                    save_data()
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    log.error(f"check_auto_alerts {chat_id}/{symbol}: {e}")
+    except Exception as e:
+        # حتی اگر کل تابع خطای غیرمنتظره بده، جاب بعدی APScheduler طبق زمان‌بندی دوباره اجرا می‌شه
+        log.error(f"check_auto_alerts fatal: {e}")
 
 # =========================
 # PRICE ALERT CHECKER
@@ -1853,40 +2442,65 @@ async def check_price_alerts(bot):
 # POSITION TRACKER
 # =========================
 async def check_expired_positions(bot):
+    """
+    هسته پوزیشن — کاملاً جدا از هسته آلرت خودکار.
+    باگ قبلی: پوزیشن قبل از موفقیت دریافت قیمت pop می‌شد و در صورت خطا
+    برای همیشه گم می‌شد. الان: فقط بعد از دریافت موفق قیمت و ثبت نتیجه pop می‌شه؛
+    در غیر این صورت با شمارنده retry دوباره تلاش می‌شه (حداکثر ۳ بار) تا داده گم نشه.
+    """
     now = datetime.now()
     for chat_id, udata in list(user_data.items()):
-        positions=udata.get("active_positions",{})
-        expired=[s for s,p in positions.items() if p.get("expiry") and now>=datetime.fromisoformat(p["expiry"])]
+        positions = udata.get("active_positions", {})
+        expired = [s for s, p in positions.items() if p.get("expiry") and now >= datetime.fromisoformat(p["expiry"])]
         for sym in expired:
             try:
-                pos=positions.pop(sym); ticker=await get_ticker(sym)
-                if not ticker: continue
-                current=ticker["price"]; entry=pos["entry"]; direction=pos["direction"]
-                tp1=pos.get("tp1"); sl=pos.get("stop_loss")
+                pos = positions[sym]
+                ticker = await get_ticker(sym)
+                if not ticker:
+                    pos["retry"] = pos.get("retry", 0) + 1
+                    if pos["retry"] >= 3:
+                        # بعد از ۳ بار تلاش ناموفق، بدون داده قیمت به‌عنوان نامشخص ثبت و بسته می‌شه
+                        positions.pop(sym, None)
+                        log.warning(f"position {sym}/{chat_id} بدون قیمت نهایی بسته شد (retry exceeded)")
+                    continue
+
+                positions.pop(sym, None)  # فقط بعد از موفقیت حذف می‌شه
+                current = ticker["price"]; entry = pos["entry"]; direction = pos["direction"]
+                tp1 = pos.get("tp1"); sl = pos.get("stop_loss")
                 if "LONG" in direction:
-                    pnl_pct=(current-entry)/entry*100; hit_tp1=tp1 and current>=tp1; hit_sl=sl and current<=sl
+                    pnl_pct = (current-entry)/entry*100; hit_tp1 = tp1 and current >= tp1; hit_sl = sl and current <= sl
                 else:
-                    pnl_pct=(entry-current)/entry*100; hit_tp1=tp1 and current<=tp1; hit_sl=sl and current>=sl
-                stats=udata.setdefault("signal_stats",{"total":0,"win":0,"loss":0,"neutral_exit":0})
-                if hit_tp1:     result="✅ موفق — به TP1 رسید!"; stats["win"]+=1
-                elif hit_sl:    result="❌ استاپ لاس خورد";       stats["loss"]+=1
-                elif pnl_pct>0: result=f"🟡 سود جزئی ({pnl_pct:+.2f}%)"; stats["neutral_exit"]+=1
-                else:           result=f"🟠 ضرر جزئی ({pnl_pct:+.2f}%)"; stats["neutral_exit"]+=1
-                history=udata.setdefault("signal_history",[])
+                    pnl_pct = (entry-current)/entry*100; hit_tp1 = tp1 and current <= tp1; hit_sl = sl and current >= sl
+
+                stats = udata.setdefault("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
+                is_win = False
+                if hit_tp1:     result = "✅ موفق — به TP1 رسید!"; stats["win"] += 1; is_win = True
+                elif hit_sl:    result = "❌ استاپ لاس خورد";       stats["loss"] += 1
+                elif pnl_pct>0: result = f"🟡 سود جزئی ({pnl_pct:+.2f}%)"; stats["neutral_exit"] += 1; is_win = True
+                else:           result = f"🟠 ضرر جزئی ({pnl_pct:+.2f}%)"; stats["neutral_exit"] += 1
+
+                history = udata.setdefault("signal_history", [])
                 for h in history:
-                    if h.get("symbol")==sym and h.get("result")=="در انتظار":
-                        h["result"]=result; h["exit_price"]=current; h["pnl_pct"]=round(pnl_pct,2); break
+                    if h.get("symbol") == sym and h.get("result") == "در انتظار":
+                        h["result"] = result; h["exit_price"] = current; h["pnl_pct"] = round(pnl_pct, 2); break
+
+                # امتیازدهی پویا: اندیکاتورهایی که در این سیگنال شرکت داشتن آپدیت می‌شن
+                cats = pos.get("categories_used", [])
+                if cats: update_indicator_performance(sym, cats, is_win)
+
                 await bot.send_message(chat_id=int(chat_id),
                     text=(f"⏰ پوزیشن {sym} منقضی شد!\n\n"
                           f"جهت: {direction}\nورود: {format_price(entry)}\n"
                           f"قیمت الان: {format_price(current)}\nP&L: {pnl_pct:+.2f}%\n\nنتیجه: {result}"))
-            except Exception as e: log.error(f"expired {chat_id}/{sym}: {e}")
+            except Exception as e:
+                log.error(f"expired {chat_id}/{sym}: {e}")
         save_data()
 
 # =========================
 # CORE SENDER
 # =========================
 async def send_analysis(bot, chat_id, symbols):
+    """هسته ارسال تحلیل — کاملاً جدا از هسته آلرت خودکار (خطا در این تابع هرگز آلرت خودکار رو قطع نمی‌کنه)"""
     if not user_data.get(chat_id,{}).get("active",True): return
     mode_key=user_data.get(chat_id,{}).get("trading_mode","short")
     capital=user_data.get(chat_id,{}).get("capital")
@@ -1899,12 +2513,17 @@ async def send_analysis(bot, chat_id, symbols):
             if not a:
                 await bot.send_message(chat_id=int(chat_id), text=f"❌ خطا در تحلیل {symbol}")
                 continue
-            fr    = await get_funding_rate(symbol)
-            whale = await get_whale_alerts(symbol)
+            whale     = await get_whale_alerts(symbol)
+            news      = await get_news_sentiment(symbol)
+            price_cmp = await get_price_comparison(symbol)
+            liq_map   = await get_liquidation_heatmap(symbol) if a["direction"]!="NEUTRAL ⚪" else None
+            ai_expl   = await get_ai_explanation(a, a.get("futures_data"), news) if a["direction"]!="NEUTRAL ⚪" else None
+
             if a["direction"]!="NEUTRAL ⚪" and a["expiry"]:
                 user_data[chat_id].setdefault("active_positions",{})[symbol] = {
                     "direction":a["direction"],"entry":a["entry"],
-                    "stop_loss":a["stop_loss"],"tp1":a["tp1"],"expiry":a["expiry"],}
+                    "stop_loss":a["stop_loss"],"tp1":a["tp1"],"expiry":a["expiry"],
+                    "mode":mode_key,"categories_used":a.get("categories_used",[]),}
                 stats=user_data[chat_id].setdefault("signal_stats",{"total":0,"win":0,"loss":0,"neutral_exit":0})
                 stats["total"]+=1
                 history=user_data[chat_id].setdefault("signal_history",[])
@@ -1914,7 +2533,7 @@ async def send_analysis(bot, chat_id, symbols):
                 if len(history)>200: user_data[chat_id]["signal_history"]=history[-200:]
                 save_data()
             await bot.send_message(chat_id=int(chat_id),
-                text=build_analysis_message(a, capital, fg, fr, whale),
+                text=build_analysis_message(a, capital, fg, None, whale, news, price_cmp, liq_map, ai_expl),
                 disable_web_page_preview=True)
         except Exception as e:
             log.error(f"send_analysis {chat_id}/{symbol}: {e}")
@@ -2052,17 +2671,33 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb=[[InlineKeyboardButton("🔙 برگشت",callback_data="back_main")]]
         await query.edit_message_text(text,reply_markup=InlineKeyboardMarkup(kb)); return
 
-    if data=="menu_positions":
+    if data=="menu_positions" or data=="refresh_positions":
+        if data=="refresh_positions":
+            await query.edit_message_text("⏳ در حال بروزرسانی پوزیشن‌های زنده...")
         positions=user_data[chat_id].get("active_positions",{})
         stats=user_data[chat_id].get("signal_stats",{"total":0,"win":0,"loss":0,"neutral_exit":0})
-        text="📁 پوزیشن‌های فعال:\n\n" if positions else "هیچ پوزیشن فعالی نداری\n\n"
+        now_str = datetime.now().strftime("%H:%M:%S")
+        text=f"📁 پوزیشن‌های فعال (زنده — {now_str}):\n\n" if positions else "هیچ پوزیشن فعالی نداری\n\n"
         for sym, pos in positions.items():
             exp=datetime.fromisoformat(pos["expiry"]).strftime("%H:%M")
-            text+=f"• {sym} | {pos['direction']}\n  ورود: {format_price(pos['entry'])} | SL: {format_price(pos['stop_loss'])}\n  TP1: {format_price(pos['tp1'])} | انقضا: {exp}\n\n"
+            live_ticker = await get_ticker(sym)
+            direction = pos["direction"]; entry = pos["entry"]
+            if live_ticker:
+                current = live_ticker["price"]
+                pnl_pct = (current-entry)/entry*100 if "LONG" in direction else (entry-current)/entry*100
+                pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                live_line = f"  💵 قیمت لحظه‌ای: {format_price(current)}  |  {pnl_emoji} PnL: {pnl_pct:+.2f}%\n"
+            else:
+                live_line = "  ⚠️ قیمت لحظه‌ای در دسترس نیست\n"
+            text+=(f"• {sym} | {direction}\n"
+                   f"  ورود: {format_price(pos['entry'])} | SL: {format_price(pos['stop_loss'])}\n"
+                   f"  TP1: {format_price(pos['tp1'])} | انقضا: {exp}\n"
+                   f"{live_line}\n")
         total=stats["total"]; win=stats["win"]; loss=stats["loss"]
         wr=round(win/total*100,1) if total>0 else 0
         text+=f"📊 آمار کلی: کل {total} | ✅{win} | ❌{loss} | نرخ موفقیت: {wr}%"
-        kb=[[InlineKeyboardButton("🔙 برگشت",callback_data="back_main")]]
+        kb=[[InlineKeyboardButton("🔄 بروزرسانی زنده",callback_data="refresh_positions")],
+            [InlineKeyboardButton("🔙 برگشت",callback_data="back_main")]]
         await query.edit_message_text(text,reply_markup=InlineKeyboardMarkup(kb)); return
 
     if data=="menu_history":
@@ -2111,6 +2746,20 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t,m=main_menu(chat_id)
         await context.bot.send_message(chat_id=int(chat_id),text=t,reply_markup=m); return
 
+    if data=="menu_hotcoins":
+        await query.edit_message_text("⏳ در حال اسکن ارزهای پرنوسان فیوچرز...")
+        hot = await scan_hot_coins()
+        if not hot:
+            text = "❌ در حال حاضر ارز پرنوسان قابل‌توجهی پیدا نشد"
+        else:
+            text = "🆕 ارزهای داغ و پرنوسان (۲۴h)\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            for c in hot:
+                text += f"• {c['symbol']} | {c['change_pct']:+.2f}%  |  حجم: ${c['quote_volume']:,.0f}\n"
+            text += "\n⚠️ نوسان بالا = فرصت و ریسک بالا هر دو؛ حجم پایین‌تر معامله کن و حتماً SL بذار.\n"
+            text += "ℹ️ این تشخیص بر اساس تغییر قیمت/حجم غیرعادیه، نه تاریخ دقیق لیست‌شدن در صرافی."
+        kb=[[InlineKeyboardButton("🔙 برگشت",callback_data="back_main")]]
+        await context.bot.send_message(chat_id=int(chat_id), text=text, reply_markup=InlineKeyboardMarkup(kb)); return
+
     if data=="menu_whale":
         symbols = user_data[chat_id].get("symbols",[]); keyboard=[]
         for sym in symbols[:6]:
@@ -2120,18 +2769,20 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("whale_"):
         sym = data[6:]
-        await query.edit_message_text(f"⏳ در حال بررسی آنچین {sym}...")
+        await query.edit_message_text(f"⏳ در حال بررسی معاملات بزرگ {sym}...")
         wa = await get_whale_alerts(sym)
         if not wa:
-            msg = f"❌ داده آنچین برای {sym} در دسترس نیست"
+            msg = f"❌ داده معاملات بزرگ برای {sym} در دسترس نیست"
         else:
-            alert_emoji = "🚨" if wa.get("alert") else ("🟢" if wa.get("bullish") else "🟡")
-            msg  = f"🐋 تحلیل آنچین — {sym}\n━━━━━━━━━━━━━━━━━━━━\n"
-            msg += f"{alert_emoji} وضعیت: {'هشدار نهنگ!' if wa['alert'] else ('صعودی' if wa['bullish'] else 'عادی')}\n\n"
-            msg += f"📊 تراکنش‌های بزرگ: {wa.get('large_tx',0)}\n"
-            msg += f"👤 آدرس‌های فعال:  {wa.get('active_addr',0):,}\n"
-            msg += f"🔢 کل تراکنش‌ها:   {wa.get('tx_count',0):,}\n\n"
-            if wa["alert"]: msg += "⚠️ حجم تراکنش‌های بزرگ بالاتر از معمول — احتمال حرکت قیمتی\n"
+            alert_emoji = "🚨" if wa.get("alert") else ("🟢" if wa.get("bullish") else ("🔴" if wa.get("bearish") else "🟡"))
+            status = "هشدار نهنگ!" if wa["alert"] else ("فشار خرید" if wa["bullish"] else ("فشار فروش" if wa.get("bearish") else "عادی"))
+            msg  = f"🐋 معاملات بزرگ (نهنگ) — {sym}\n━━━━━━━━━━━━━━━━━━━━\n"
+            msg += f"{alert_emoji} وضعیت: {status}\n\n"
+            msg += f"📊 تعداد معاملات بزرگ:  {wa.get('large_tx',0)}\n"
+            msg += f"🟢 حجم خرید نهنگ‌ها:   ${wa.get('buy_usd',0):,.0f}\n"
+            msg += f"🔴 حجم فروش نهنگ‌ها:   ${wa.get('sell_usd',0):,.0f}\n\n"
+            msg += "ℹ️ این آمار از معاملات بزرگ (≥$100k) داخل صرافیه، نه رصد ولت آنچین.\n"
+            if wa["alert"]: msg += "⚠️ فشار قابل‌توجه نهنگ‌ها — احتمال حرکت قیمتی\n"
         await context.bot.send_message(chat_id=int(chat_id), text=msg)
         t,m=main_menu(chat_id)
         await context.bot.send_message(chat_id=int(chat_id),text=t,reply_markup=m); return
@@ -2236,17 +2887,20 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     global session
     session=aiohttp.ClientSession()
-    scheduler.start(); load_data()
+    scheduler.start(); load_data(); load_adaptive_weights()
     for chat_id in user_data:
         if user_data[chat_id].get("active",True):
             try: schedule_user_job(app,chat_id)
             except Exception as e: log.error(f"Schedule error {chat_id}: {e}")
-    # job های سیستمی
-    scheduler.add_job(check_expired_positions,"interval",minutes=5,  args=[app.bot])
+    # job های سیستمی — هسته پوزیشن و هسته آلرت کاملاً جدا از هم هستن
+    scheduler.add_job(check_expired_positions,"interval",minutes=5,  args=[app.bot])  # هسته پوزیشن
     scheduler.add_job(check_price_alerts,     "interval",minutes=2,  args=[app.bot])
-    scheduler.add_job(check_auto_alerts,      "interval",minutes=30, args=[app.bot])  # آلرت خودکار هر ۳۰ دقیقه
+    scheduler.add_job(check_auto_alerts,      "interval",minutes=30, args=[app.bot])  # هسته آلرت خودکار
     scheduler.add_job(backup_data,            "interval",minutes=10)
-    log.info("✅ Bot v2.0 started — موتورهای تحلیل اختصاصی فعال")
+    scheduler.add_job(clear_expired_cache,    "interval",minutes=10)
+    if not GROQ_API_KEY:
+        log.warning("⚠️ GROQ_API_KEY تنظیم نشده — توضیح سیگنال‌ها قانون‌محور (fallback) خواهد بود")
+    log.info("✅ Bot v3.0 (Futures Edition) started — موتورهای تحلیل فیوچرز فعال")
 
 def main():
     app=Application.builder().token(TOKEN).post_init(post_init).build()
