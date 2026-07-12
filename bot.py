@@ -433,6 +433,101 @@ async def get_ticker(symbol):
     """کش ۲ دقیقه‌ای برای قیمت لحظه‌ای"""
     return await cached_call(f"ticker:{symbol}", lambda: _get_ticker_uncached(symbol))
 
+# =========================
+# FUTURES MARKET DATA (کاملاً جدا از اسپات)
+# قیمت/کندلی که پایه تحلیل فیوچرزه، از بازار فیوچرز واقعی می‌گیریم نه اسپات
+# =========================
+_BYBIT_TF = {"1m":"1","5m":"5","15m":"15","1h":"60","4h":"240","1d":"D","1w":"W"}
+
+async def _klines_binance_futures(symbol, interval, limit):
+    sym = symbol.replace("USDT", "") + "USDT"
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={sym}&interval={interval}&limit={limit}"
+    data, _ = await throttled_get("binance", url, timeout=15)
+    if not data or len(data) < 30: return None
+    return {
+        "closes":  np.array([float(c[4]) for c in data]),
+        "highs":   np.array([float(c[2]) for c in data]),
+        "lows":    np.array([float(c[3]) for c in data]),
+        "opens":   np.array([float(c[1]) for c in data]),
+        "volumes": np.array([float(c[5]) for c in data]),
+    }
+
+async def _klines_bybit_futures(symbol, interval, limit):
+    sym = symbol.replace("USDT", "") + "USDT"
+    tf  = _BYBIT_TF.get(interval, "60")
+    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={sym}&interval={tf}&limit={limit}"
+    data, _ = await throttled_get("bybit", url, timeout=15)
+    if not data or not isinstance(data, dict): return None
+    rows = (data.get("result") or {}).get("list") or []
+    if len(rows) < 30: return None
+    rows = list(reversed(rows))  # Bybit جدیدترین رو اول می‌ده؛ باید قدیمی→جدید بشه
+    try:
+        return {
+            "closes":  np.array([float(r[4]) for r in rows]),
+            "highs":   np.array([float(r[2]) for r in rows]),
+            "lows":    np.array([float(r[3]) for r in rows]),
+            "opens":   np.array([float(r[1]) for r in rows]),
+            "volumes": np.array([float(r[5]) for r in rows]),
+        }
+    except Exception:
+        return None
+
+async def _get_futures_klines_uncached(symbol, interval, limit):
+    for name, fn in [("Binance-Futures", _klines_binance_futures), ("Bybit-Linear", _klines_bybit_futures)]:
+        try:
+            r = await fn(symbol, interval, limit)
+            if r is not None: return r
+        except Exception as e:
+            log.warning(f"get_futures_klines [{name}] {symbol}/{interval}: {e}")
+    # فال‌بک نهایی: قیمت اسپات (بهتر از هیچی، ولی با تفاوت جزئی basis نسبت به فیوچرز)
+    log.warning(f"⚠️ فیوچرز {symbol}/{interval} در دسترس نبود؛ فال‌بک موقت به قیمت اسپات")
+    return await _get_klines_uncached(symbol, interval, limit)
+
+async def get_futures_klines(symbol, interval="1h", limit=150):
+    """کندل واقعی بازار فیوچرز (Binance-Futures → Bybit-Linear → فال‌بک اسپات)"""
+    key = f"fklines:{symbol}:{interval}:{limit}"
+    return await cached_call(key, lambda: _get_futures_klines_uncached(symbol, interval, limit))
+
+async def _ticker_binance_futures(symbol):
+    sym = symbol.replace("USDT", "") + "USDT"
+    url = f"https://fapi.binance.com/fapi/v1/ticker/24hr?symbol={sym}"
+    data, _ = await throttled_get("binance", url, timeout=10)
+    if not data or not data.get("lastPrice"): return None
+    return {"price": float(data["lastPrice"]), "change": float(data.get("priceChangePercent", 0)),
+            "high": float(data.get("highPrice", data["lastPrice"])), "low": float(data.get("lowPrice", data["lastPrice"])),
+            "volume": float(data.get("volume", 0)), "quote_volume": float(data.get("quoteVolume", 0))}
+
+async def _ticker_bybit_futures(symbol):
+    sym = symbol.replace("USDT", "") + "USDT"
+    url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}"
+    data, _ = await throttled_get("bybit", url, timeout=10)
+    if not data or not isinstance(data, dict): return None
+    rows = (data.get("result") or {}).get("list") or []
+    if not rows: return None
+    t = rows[0]
+    try:
+        price = float(t["lastPrice"])
+        change = float(t.get("price24hPcnt", 0)) * 100
+        return {"price": price, "change": round(change, 2),
+                "high": float(t.get("highPrice24h", price)), "low": float(t.get("lowPrice24h", price)),
+                "volume": float(t.get("volume24h", 0)), "quote_volume": float(t.get("turnover24h", 0))}
+    except Exception:
+        return None
+
+async def _get_futures_ticker_uncached(symbol):
+    for name, fn in [("Binance-Futures", _ticker_binance_futures), ("Bybit-Linear", _ticker_bybit_futures)]:
+        try:
+            r = await fn(symbol)
+            if r: return r
+        except Exception as e:
+            log.warning(f"get_futures_ticker [{name}] {symbol}: {e}")
+    log.warning(f"⚠️ قیمت فیوچرز {symbol} در دسترس نبود؛ فال‌بک موقت به قیمت اسپات")
+    return await _get_ticker_uncached(symbol)
+
+async def get_futures_ticker(symbol):
+    """قیمت لحظه‌ای واقعی بازار فیوچرز (Binance-Futures → Bybit-Linear → فال‌بک اسپات)"""
+    return await cached_call(f"fticker:{symbol}", lambda: _get_futures_ticker_uncached(symbol))
+
 async def get_price_comparison(symbol):
     """
     مقایسه قیمت بین صرافی‌ها (به‌خصوص Toobit) — برای رفع اختلاف قیمت.
@@ -619,7 +714,7 @@ async def _get_liquidation_heatmap_uncached(symbol):
     نواحی احتمالی تجمع لیکوئیدیشن رو تخمین می‌زنه — نه داده واقعی صرافی.
     """
     try:
-        ticker = await get_ticker(symbol)
+        ticker = await get_futures_ticker(symbol)
         oi     = await get_open_interest(symbol)
         fr     = await get_funding_rate(symbol)
         if not ticker: return None
@@ -1527,8 +1622,8 @@ SCORE_ENGINES = {
 # =========================
 # TIMEFRAME ANALYSIS
 # =========================
-async def analyze_timeframe(symbol, tf, limit, mode_key="short"):
-    kdata = await get_klines(symbol, tf, limit)
+async def analyze_timeframe(symbol, tf, limit, mode_key="short", market_type="futures"):
+    kdata = await (get_futures_klines(symbol, tf, limit) if market_type == "futures" else get_klines(symbol, tf, limit))
     if not kdata: return None
     closes=kdata["closes"]; highs=kdata["highs"]
     lows=kdata["lows"];     opens=kdata["opens"]
@@ -1585,20 +1680,24 @@ async def analyze_timeframe(symbol, tf, limit, mode_key="short"):
 # =========================
 # FULL ANALYSIS
 # =========================
-async def full_analysis(symbol, mode_key="short"):
-    ticker = await get_ticker(symbol)
+async def full_analysis(symbol, mode_key="short", market_type="futures"):
+    ticker = await (get_futures_ticker(symbol) if market_type == "futures" else get_ticker(symbol))
     if not ticker: return None
 
     mode  = TRADING_MODES[mode_key]
     price = ticker["price"]
 
-    tasks = [analyze_timeframe(symbol, tf, mode["kline_limit"], mode_key) for tf in mode["timeframes"]]
-    futures_tasks = [get_funding_rate(symbol), get_open_interest(symbol),
-                      get_long_short_ratio(symbol), get_orderbook_imbalance(symbol), get_cvd(symbol)]
+    tasks = [analyze_timeframe(symbol, tf, mode["kline_limit"], mode_key, market_type) for tf in mode["timeframes"]]
     n_tf = len(tasks)
-    gathered = await asyncio.gather(*tasks, *futures_tasks)
-    raw_results = gathered[:n_tf]
-    fr_d, oi_d, lsr_d, obi_d, cvd_d = gathered[n_tf:]
+    if market_type == "futures":
+        futures_tasks = [get_funding_rate(symbol), get_open_interest(symbol),
+                          get_long_short_ratio(symbol), get_orderbook_imbalance(symbol), get_cvd(symbol)]
+        gathered = await asyncio.gather(*tasks, *futures_tasks)
+        raw_results = gathered[:n_tf]
+        fr_d, oi_d, lsr_d, obi_d, cvd_d = gathered[n_tf:]
+    else:
+        raw_results = await asyncio.gather(*tasks)
+        fr_d = oi_d = lsr_d = obi_d = cvd_d = None
 
     tf_results = {}; total_score = 0; all_reasons = []; all_categories = set()
 
@@ -1659,7 +1758,8 @@ async def full_analysis(symbol, mode_key="short"):
     if total_score >= threshold and agreement >= min_agree and not is_ranging and volume_ok:
         direction = "LONG 🟢"
     elif total_score <= -threshold and agreement >= min_agree and not is_ranging and volume_ok:
-        direction = "SHORT 🔴"
+        direction = "SHORT 🔴" if market_type == "futures" else "AVOID 🚫"
+        # توجه: تو اسپات نمی‌شه واقعاً شورت گرفت؛ این فقط توصیه‌ی «وارد نشو/کاهش پوزیشن» است
 
     if direction != "NEUTRAL ⚪":
         main_ind = main_result.get("indicators", {}) if main_result else {}
@@ -1682,6 +1782,7 @@ async def full_analysis(symbol, mode_key="short"):
             sl_m = mode["sl_atr_mult"] * 1.2
             tp_m = [mode["tp_atr_mults"][0]*1.1, mode["tp_atr_mults"][1]*1.2]
 
+    if direction in ("LONG 🟢", "SHORT 🔴"):
         if direction == "LONG 🟢":
             sl  = round(max(price - atr_v*sl_m, sr_v["near_support"]*0.997), 6)
             tp1 = round(price + atr_v*tp_m[0], 6)
@@ -1695,8 +1796,10 @@ async def full_analysis(symbol, mode_key="short"):
 
         expiry = (datetime.now() + timedelta(hours=mode["hold_hours"])).isoformat()
 
+
     return {
         "symbol": symbol, "mode": mode_key, "mode_label": mode["label"],
+        "market_type": market_type,
         "price": price, "ticker": ticker,
         "direction": direction, "score": total_score,
         "confidence": confidence, "agreement": round(agreement*100, 1),
@@ -1713,16 +1816,16 @@ async def full_analysis(symbol, mode_key="short"):
 # =========================
 # BACKTEST ساده
 # =========================
-async def run_backtest(symbol, mode_key="short", periods=20):
+async def run_backtest(symbol, mode_key="short", periods=20, market_type="futures"):
     """
     بک‌تست ساده: سیگنال‌های گذشته رو شبیه‌سازی می‌کنیم
-    با داده‌های تاریخی از API
+    با داده‌های تاریخی از API (فیوچرز یا اسپات، بسته به market_type)
     """
     mode    = TRADING_MODES[mode_key]
     main_tf = mode["timeframes"][1] if len(mode["timeframes"]) > 1 else mode["timeframes"][0]
     limit   = mode["kline_limit"] + periods
 
-    kdata = await get_klines(symbol, main_tf, limit)
+    kdata = await (get_futures_klines(symbol, main_tf, limit) if market_type=="futures" else get_klines(symbol, main_tf, limit))
     if not kdata or len(kdata["closes"]) < 60: return None
 
     closes  = kdata["closes"]; highs   = kdata["highs"]
@@ -1813,7 +1916,9 @@ async def run_backtest(symbol, mode_key="short", periods=20):
 # AUTO-BACKTEST — انتخاب خودکار بهترین روش تحلیل برای هر ارز
 # =========================
 BEST_MODE_FILE = os.environ.get("BEST_MODE_FILE", "best_mode.json")
-best_mode_data = {}   # {symbol: {"best_mode":..., "win_rate":..., "total":..., "updated":...}}
+best_mode_data = {}   # {"symbol|market_type": {"best_mode":..., "win_rate":..., "total":..., "updated":...}}
+
+def _bm_key(symbol, market_type): return f"{symbol}|{market_type}"
 
 def load_best_mode():
     global best_mode_data
@@ -1831,15 +1936,15 @@ def save_best_mode():
     except Exception as e:
         log.error(f"save_best_mode: {e}")
 
-async def run_backtest_matrix(symbol, periods=15):
-    """بک‌تست همون ارز روی هر ۴ حالت معاملاتی (اسکالپ/کوتاه‌مدت/میان‌مدت/بلندمدت)"""
+async def run_backtest_matrix(symbol, market_type="futures", periods=15):
+    """بک‌تست همون ارز (اسپات یا فیوچرز) روی هر ۴ حالت معاملاتی (اسکالپ/کوتاه‌مدت/میان‌مدت/بلندمدت)"""
     out = {}
     for mk in TRADING_MODES:
         try:
-            r = await run_backtest(symbol, mk, periods=periods)
+            r = await run_backtest(symbol, mk, periods=periods, market_type=market_type)
             if r: out[mk] = r
         except Exception as e:
-            log.warning(f"run_backtest_matrix {symbol}/{mk}: {e}")
+            log.warning(f"run_backtest_matrix {symbol}/{mk}/{market_type}: {e}")
         await asyncio.sleep(0.3)
     return out
 
@@ -1852,38 +1957,41 @@ def pick_best_mode(matrix, min_samples=6):
     best_mk, best_r = max(candidates, key=lambda x: x[1]["win_rate"])
     return best_mk, best_r["win_rate"], best_r["total"]
 
-def get_best_mode(symbol, default="short"):
-    """حالتی که بک‌تست خودکار برای این ارز بهترین تشخیص داده؛ اگه هنوز داده‌ای نبود، پیش‌فرض کاربر"""
-    entry = best_mode_data.get(symbol)
+def get_best_mode(symbol, market_type="futures", default="short"):
+    """حالتی که بک‌تست خودکار برای این ارز (در همون بازار اسپات/فیوچرز) بهترین تشخیص داده"""
+    entry = best_mode_data.get(_bm_key(symbol, market_type))
     if not entry: return default
     return entry.get("best_mode", default)
 
 async def auto_backtest_all_symbols(app=None):
     """
-    بک‌تست خودکار دوره‌ای (هر ۱۲ ساعت): برای تمام ارزهای زیرنظر کاربرها،
-    هر ۴ حالت معاملاتی رو تست می‌کنه، بهترین حالت هر ارز رو ذخیره می‌کنه،
-    و از نتایج تاریخی هر سیگنال، امتیازدهی پویا (وزن هر اندیکاتور روی هر ارز) رو آپدیت می‌کنه.
+    بک‌تست خودکار دوره‌ای (هر ۱۲ ساعت): برای تمام (ارز، نوع بازار)هایی که کاربرها زیر نظر دارن،
+    هر ۴ حالت معاملاتی رو تست می‌کنه، بهترین حالت رو ذخیره می‌کنه،
+    و از نتایج تاریخی هر سیگنال، امتیازدهی پویا رو آپدیت می‌کنه.
     """
-    symbols = set()
+    pairs = set()
     for udata in user_data.values():
-        symbols.update(udata.get("symbols", []))
-    if not symbols:
+        mt = udata.get("market_type", "futures")
+        for sym in udata.get("symbols", []):
+            pairs.add((sym, mt))
+    if not pairs:
         log.info("auto_backtest_all_symbols: هیچ ارزی زیر نظر نیست"); return
 
-    log.info(f"🧪 شروع بک‌تست خودکار برای {len(symbols)} ارز...")
-    for sym in symbols:
+    log.info(f"🧪 شروع بک‌تست خودکار برای {len(pairs)} جفت (ارز/بازار)...")
+    for sym, mt in pairs:
         try:
-            matrix = await run_backtest_matrix(sym)
+            matrix = await run_backtest_matrix(sym, market_type=mt)
             if not matrix: continue
             picked = pick_best_mode(matrix)
             if not picked: continue
             best_mk, wr, total = picked
-            best_mode_data[sym] = {"best_mode": best_mk, "win_rate": wr, "total": total,
-                                     "updated": datetime.now().isoformat(),
-                                     "all_modes": {mk: r["win_rate"] for mk, r in matrix.items()}}
-            log.info(f"  {sym}: بهترین حالت={TRADING_MODES[best_mk]['label']} (نرخ موفقیت={wr}%, نمونه={total})")
+            best_mode_data[_bm_key(sym, mt)] = {
+                "best_mode": best_mk, "win_rate": wr, "total": total, "market_type": mt,
+                "updated": datetime.now().isoformat(),
+                "all_modes": {mk: r["win_rate"] for mk, r in matrix.items()}}
+            log.info(f"  {sym} [{mt}]: بهترین حالت={TRADING_MODES[best_mk]['label']} (نرخ موفقیت={wr}%, نمونه={total})")
         except Exception as e:
-            log.error(f"auto_backtest_all_symbols {sym}: {e}")
+            log.error(f"auto_backtest_all_symbols {sym}/{mt}: {e}")
         await asyncio.sleep(0.5)
     save_best_mode()
     log.info("✅ بک‌تست خودکار تمام شد.")
@@ -2238,7 +2346,7 @@ def init_user(chat_id):
     if chat_id not in user_data:
         user_data[chat_id] = {
             "symbols": ["BTCUSDT","ETHUSDT","SOLUSDT"],
-            "interval": 60, "active": True, "trading_mode": "short",
+            "interval": 60, "active": True, "trading_mode": "short", "market_type": "futures",
             "capital": None, "active_positions": {}, "signal_history": [],
             "signal_stats": {"total":0,"win":0,"loss":0,"neutral_exit":0},
             "price_alerts": {},
@@ -2271,7 +2379,9 @@ def build_analysis_message(a, capital=None, fg=None, fr=None, whale=None,
     oi  = fd.get("oi"); lsr = fd.get("lsr"); obi = fd.get("obi"); cvd = fd.get("cvd")
 
     msg  = f"━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"📊 {sym} | {now}\n"
+    is_futures = a.get("market_type", "futures") == "futures"
+    market_label = "🚀 فیوچرز (اهرم‌دار)" if is_futures else "💰 اسپات (بدون اهرم)"
+    msg += f"📊 {sym} | {market_label} | {now}\n"
     msg += f"━━━━━━━━━━━━━━━━━━━━\n\n"
     msg += f"💵 قیمت: {format_price(a['price'])} USDT\n"
     msg += f"📈 تغییر ۲۴h: {a['ticker']['change']:+.2f}%\n"
@@ -2282,23 +2392,23 @@ def build_analysis_message(a, capital=None, fg=None, fr=None, whale=None,
 
     if fg:
         msg += f"😱 Fear&Greed: {fg['value']} — {fg['label']} {fg['emoji']}\n"
-    if fr:
+    if is_futures and fr:
         fr_emoji = "🟢" if fr["bullish"] else "🔴"
         fr_warn  = " ⚠️ افراطی!" if fr["extreme"] else ""
         msg += f"{fr_emoji} Funding Rate: {fr['rate']}%{fr_warn}\n"
-    if oi and oi.get("change_pct") is not None:
+    if is_futures and oi and oi.get("change_pct") is not None:
         oi_emoji = "📈" if oi["rising"] else ("📉" if oi["falling"] else "➖")
         msg += f"{oi_emoji} Open Interest: {oi['change_pct']:+.2f}٪ (۶ساعته)\n"
-    if lsr:
+    if is_futures and lsr:
         lsr_warn = " ⚠️ ازدحام!" if lsr["extreme"] else ""
         msg += f"⚖️ Long/Short: {lsr['long_pct']}٪ / {lsr['short_pct']}٪{lsr_warn}\n"
-    if obi and obi["bias"] != "balanced":
+    if is_futures and obi and obi["bias"] != "balanced":
         obi_emoji = "🟢" if "bid" in obi["bias"] else "🔴"
         msg += f"{obi_emoji} Order Book Imbalance: {obi['imbalance_pct']:+.1f}٪ ({obi['bias']})\n"
-    if cvd and cvd.get("imbalance") in ("strong_bullish", "strong_bearish"):
+    if is_futures and cvd and cvd.get("imbalance") in ("strong_bullish", "strong_bearish"):
         cvd_emoji = "🟢" if cvd["imbalance"] == "strong_bullish" else "🔴"
         msg += f"{cvd_emoji} CVD: {cvd['imbalance']} (قدرت: {cvd['strength']})\n"
-    if liq_map:
+    if is_futures and liq_map:
         msg += f"🗺 لیکوئیدیشن تخمینی: پایین {format_price(liq_map['long_liq_zone'])} | بالا {format_price(liq_map['short_liq_zone'])}\n"
     if news and news.get("label") and "خنثی" not in news["label"]:
         msg += f"📰 اخبار: {news['label']}\n"
@@ -2341,7 +2451,13 @@ def build_analysis_message(a, capital=None, fg=None, fr=None, whale=None,
             msg += f"⏰ نگهداری: {a['hold_label']}  |  انقضا: {exp}\n"
 
         msg += build_mm_section(capital, a)
-        msg += build_leverage_section(a, capital)
+        if is_futures:
+            msg += build_leverage_section(a, capital)
+        else:
+            msg += "\n💰 معامله اسپات — بدون اهرم؛ فقط با سرمایه نقدی خودت وارد شو.\n"
+
+    if a["direction"] == "AVOID 🚫":
+        msg += "\n🚫 توصیه: در بازار اسپات نمی‌شه شورت گرفت — بهتره وارد نشی یا اگه پوزیشن داری، کاهشش بدی.\n"
 
     if a["reasons"]:
         msg += f"\n📋 دلایل اصلی:\n"
@@ -2463,12 +2579,16 @@ def main_menu(chat_id):
     symbols = ud.get("symbols", []); mode_key = ud.get("trading_mode", "short")
     capital = ud.get("capital"); cap_text = f"${capital:,.0f}" if capital else "تنظیم نشده ⚠️"
     auto_alert = ud.get("auto_alert_enabled", True)
+    market_type = ud.get("market_type", "futures")
     toggle_btn = (InlineKeyboardButton("⏹ توقف ارسال", callback_data="toggle_off")
                   if is_active else InlineKeyboardButton("▶️ شروع ارسال", callback_data="toggle_on"))
     alert_btn = (InlineKeyboardButton("🔕 آلرت خودکار: روشن", callback_data="toggle_autoalert")
                  if auto_alert else InlineKeyboardButton("🔔 آلرت خودکار: خاموش", callback_data="toggle_autoalert"))
+    market_btn = (InlineKeyboardButton("🚀 بازار: فیوچرز (اهرم‌دار)", callback_data="toggle_market")
+                  if market_type=="futures" else InlineKeyboardButton("💰 بازار: اسپات (بدون اهرم)", callback_data="toggle_market"))
     keyboard = [
         [InlineKeyboardButton("📊 تحلیل همین الان", callback_data="do_analysis")],
+        [market_btn],
         [InlineKeyboardButton("💰 قیمت لحظه‌ای", callback_data="menu_price")],
         [toggle_btn],
         [alert_btn],
@@ -2487,8 +2607,10 @@ def main_menu(chat_id):
          InlineKeyboardButton("⏱ بازه ارسال", callback_data="menu_interval")],
     ]
     status = "🟢 فعال" if is_active else "🔴 متوقف"
+    market_label = "🚀 فیوچرز (اهرم‌دار)" if market_type=="futures" else "💰 اسپات (بدون اهرم)"
     text = (f"🤖 ربات تحلیل ارز دیجیتال\n━━━━━━━━━━━━━━━\n"
             f"وضعیت: {status}\n"
+            f"بازار: {market_label}\n"
             f"ارزها: {len(symbols)} عدد\n"
             f"بازه: {TRADING_MODES[mode_key]['label']}\n"
             f"سرمایه: {cap_text}\n"
@@ -2571,15 +2693,16 @@ async def check_auto_alerts(bot):
             symbols   = udata.get("symbols", [])
             mode_key  = udata.get("trading_mode", "short")
             auto_mode = udata.get("auto_mode_enabled", True)
+            market_type = udata.get("market_type", "futures")
             threshold = udata.get("auto_alert_threshold", 8)
             capital   = udata.get("capital")
 
             for symbol in symbols:
                 try:
-                    sym_mode = get_best_mode(symbol, default=mode_key) if auto_mode else mode_key
-                    a = await full_analysis(symbol, sym_mode)
+                    sym_mode = get_best_mode(symbol, market_type, default=mode_key) if auto_mode else mode_key
+                    a = await full_analysis(symbol, sym_mode, market_type)
                     if not a: continue
-                    if a["direction"] == "NEUTRAL ⚪": continue
+                    if a["direction"] in ("NEUTRAL ⚪", "AVOID 🚫"): continue
                     if abs(a["score"]) < threshold: continue
                     if a["agreement"] < 75: continue
 
@@ -2591,7 +2714,7 @@ async def check_auto_alerts(bot):
 
                     fg   = await get_fear_greed()
                     news = await get_news_sentiment(symbol)
-                    liq_map = await get_liquidation_heatmap(symbol)
+                    liq_map = await get_liquidation_heatmap(symbol) if market_type=="futures" else None
                     ai_review = await get_ai_review(a, a.get("futures_data"), news)
 
                     msg  = f"🚨 آلرت خودکار — سیگنال قوی!\n"
@@ -2606,6 +2729,7 @@ async def check_auto_alerts(bot):
                             "direction": a["direction"], "entry": a["entry"],
                             "stop_loss": a["stop_loss"], "tp1": a["tp1"], "expiry": a["expiry"],
                             "mode": sym_mode, "categories_used": a.get("categories_used", []),
+                            "market_type": market_type,
                         }
                         stats = udata.setdefault("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
                         stats["total"] += 1
@@ -2665,7 +2789,8 @@ async def check_expired_positions(bot):
         for sym in expired:
             try:
                 pos = positions[sym]
-                ticker = await get_ticker(sym)
+                pos_market = pos.get("market_type", "futures")
+                ticker = await (get_futures_ticker(sym) if pos_market == "futures" else get_ticker(sym))
                 if not ticker:
                     pos["retry"] = pos.get("retry", 0) + 1
                     if pos["retry"] >= 3:
@@ -2715,27 +2840,29 @@ async def send_analysis(bot, chat_id, symbols):
     mode_key=user_data.get(chat_id,{}).get("trading_mode","short")
     capital=user_data.get(chat_id,{}).get("capital")
     auto_mode=user_data.get(chat_id,{}).get("auto_mode_enabled", True)
+    market_type=user_data.get(chat_id,{}).get("market_type", "futures")
 
     fg = await get_fear_greed()
 
     for symbol in symbols:
         try:
-            sym_mode = get_best_mode(symbol, default=mode_key) if auto_mode else mode_key
-            a=await full_analysis(symbol, sym_mode)
+            sym_mode = get_best_mode(symbol, market_type, default=mode_key) if auto_mode else mode_key
+            a=await full_analysis(symbol, sym_mode, market_type)
             if not a:
                 await bot.send_message(chat_id=int(chat_id), text=f"❌ خطا در تحلیل {symbol}")
                 continue
             whale     = await get_whale_alerts(symbol)
             news      = await get_news_sentiment(symbol)
             price_cmp = await get_price_comparison(symbol)
-            liq_map   = await get_liquidation_heatmap(symbol) if a["direction"]!="NEUTRAL ⚪" else None
+            liq_map   = await get_liquidation_heatmap(symbol) if (market_type=="futures" and a["direction"] not in ("NEUTRAL ⚪","AVOID 🚫")) else None
             ai_review = await get_ai_review(a, a.get("futures_data"), news) if a["direction"]!="NEUTRAL ⚪" else None
 
             if a["direction"]!="NEUTRAL ⚪" and a["expiry"]:
                 user_data[chat_id].setdefault("active_positions",{})[symbol] = {
                     "direction":a["direction"],"entry":a["entry"],
                     "stop_loss":a["stop_loss"],"tp1":a["tp1"],"expiry":a["expiry"],
-                    "mode":sym_mode,"categories_used":a.get("categories_used",[]),}
+                    "mode":sym_mode,"categories_used":a.get("categories_used",[]),
+                    "market_type":market_type,}
                 stats=user_data[chat_id].setdefault("signal_stats",{"total":0,"win":0,"loss":0,"neutral_exit":0})
                 stats["total"]+=1
                 history=user_data[chat_id].setdefault("signal_history",[])
@@ -2784,6 +2911,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query=update.callback_query; await query.answer()
     chat_id=str(query.message.chat.id); data=query.data; init_user(chat_id)
+
+    if data=="toggle_market":
+        cur=user_data[chat_id].get("market_type","futures")
+        new_mt = "spot" if cur=="futures" else "futures"
+        user_data[chat_id]["market_type"]=new_mt; save_data()
+        label = "💰 اسپات (بدون اهرم)" if new_mt=="spot" else "🚀 فیوچرز (اهرم‌دار)"
+        t,m=main_menu(chat_id)
+        await query.edit_message_text(f"✅ نوع بازار روی {label} تنظیم شد.\n\n"+t,reply_markup=m); return
 
     if data=="toggle_off":
         user_data[chat_id]["active"]=False; save_data()
@@ -2839,13 +2974,15 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data=="view_bestmodes":
         symbols=user_data[chat_id].get("symbols",[])
+        market_type=user_data[chat_id].get("market_type","futures")
+        market_label = "فیوچرز" if market_type=="futures" else "اسپات"
         if not best_mode_data:
             text="⏳ بک‌تست خودکار هنوز اجرا نشده — تا ۱۲ ساعت دیگه یا بعد از اولین اجرا (چند دقیقه بعد از بالا اومدن ربات) نتیجه آماده می‌شه."
         else:
-            text="📊 بهترین حالت هر ارز (بر اساس بک‌تست خودکار):\n\n"
+            text=f"📊 بهترین حالت هر ارز — بازار {market_label} (بر اساس بک‌تست خودکار):\n\n"
             shown=False
             for sym in symbols:
-                info=best_mode_data.get(sym)
+                info=best_mode_data.get(_bm_key(sym, market_type))
                 if not info:
                     text+=f"• {sym}: هنوز داده کافی نیست\n"; continue
                 shown=True
@@ -2916,7 +3053,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=f"📁 پوزیشن‌های فعال (زنده — {now_str}):\n\n" if positions else "هیچ پوزیشن فعالی نداری\n\n"
         for sym, pos in positions.items():
             exp=datetime.fromisoformat(pos["expiry"]).strftime("%H:%M")
-            live_ticker = await get_ticker(sym)
+            live_ticker = await (get_futures_ticker(sym) if pos.get("market_type","futures")=="futures" else get_ticker(sym))
             direction = pos["direction"]; entry = pos["entry"]
             if live_ticker:
                 current = live_ticker["price"]
@@ -2959,8 +3096,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("bt_"):
         sym = data[3:]; mode_key = user_data[chat_id].get("trading_mode","short")
-        await query.edit_message_text(f"⏳ در حال بک‌تست {sym} روی {TRADING_MODES[mode_key]['label']}...\nلطفاً صبر کن")
-        result = await run_backtest(sym, mode_key, periods=15)
+        market_type = user_data[chat_id].get("market_type","futures")
+        market_label = "فیوچرز" if market_type=="futures" else "اسپات"
+        await query.edit_message_text(f"⏳ در حال بک‌تست {sym} روی {TRADING_MODES[mode_key]['label']} ({market_label})...\nلطفاً صبر کن")
+        result = await run_backtest(sym, mode_key, periods=15, market_type=market_type)
         if not result:
             await context.bot.send_message(chat_id=int(chat_id), text="❌ داده کافی برای بک‌تست وجود نداره")
         else:
