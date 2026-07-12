@@ -979,38 +979,77 @@ def calc_poc(highs, lows, closes, volumes, lookback=50, bins=20):
 # =========================
 WHALE_NOTIONAL_USD = 100_000  # آستانه دلاری برای شناسایی معامله «نهنگ»
 
+async def _whale_trades_binance(symbol):
+    sym = symbol.replace("USDT", "") + "USDT"
+    url = f"https://fapi.binance.com/fapi/v1/aggTrades?symbol={sym}&limit=1000"
+    data, _ = await throttled_get("binance", url, timeout=10)
+    if not data: return None
+    big_buys=[]; big_sells=[]
+    for t in data:
+        notional = float(t["p"]) * float(t["q"])
+        if notional >= WHALE_NOTIONAL_USD:
+            (big_sells if t.get("m") else big_buys).append(notional)
+    return big_buys, big_sells
+
+async def _whale_trades_mexc(symbol):
+    """فال‌بک: معاملات اسپات MEXC (فرمت مشابه Binance)"""
+    sym = symbol.replace("USDT", "") + "USDT"
+    url = f"https://api.mexc.com/api/v3/trades?symbol={sym}&limit=1000"
+    data, _ = await throttled_get("mexc", url, timeout=10)
+    if not data or not isinstance(data, list): return None
+    big_buys=[]; big_sells=[]
+    for t in data:
+        try:
+            notional = float(t["price"]) * float(t["qty"])
+        except Exception:
+            continue
+        if notional >= WHALE_NOTIONAL_USD:
+            (big_sells if t.get("isBuyerMaker") else big_buys).append(notional)
+    return big_buys, big_sells
+
+async def _whale_trades_bybit(symbol):
+    """فال‌بک دوم: معاملات فیوچرز خطی Bybit"""
+    sym = symbol.replace("USDT", "") + "USDT"
+    url = f"https://api.bybit.com/v5/market/recent-trade?category=linear&symbol={sym}&limit=1000"
+    data, _ = await throttled_get("bybit", url, timeout=10)
+    if not data or not isinstance(data, dict): return None
+    rows = (data.get("result") or {}).get("list") or []
+    if not rows: return None
+    big_buys=[]; big_sells=[]
+    for t in rows:
+        try:
+            notional = float(t["price"]) * float(t["size"])
+        except Exception:
+            continue
+        if notional >= WHALE_NOTIONAL_USD:
+            (big_buys if t.get("side") == "Buy" else big_sells).append(notional)
+    return big_buys, big_sells
+
 async def _get_whale_alerts_uncached(symbol):
     """
-    ردیابی معاملات بزرگ (نهنگ) از روی aggTrades فیوچرز واقعی Binance.
+    ردیابی معاملات بزرگ (نهنگ) با فال‌بک بین چند صرافی (Binance → MEXC → Bybit)
+    تا در صورت غیرقابل‌دسترس بودن یکی (مثلاً محدودیت جغرافیایی)، بقیه امتحان بشن.
     ⚠️ این ردیابی حرکت‌های بزرگ داخل اردربوک صرافیه، نه رصد ولت‌های آنچین
-    (رصد واقعی ولت‌ها به سرویس پولی مثل Whale Alert / Arkham نیاز داره؛
-    این تابع جایگزین رایگان و قابل‌اتکایی برای فشار خرید/فروش نهنگ‌های صرافیه).
+    (رصد واقعی ولت‌ها به سرویس پولی مثل Whale Alert / Arkham نیاز داره).
     """
-    try:
-        sym = symbol.replace("USDT", "") + "USDT"
-        url = f"https://fapi.binance.com/fapi/v1/aggTrades?symbol={sym}&limit=1000"
-        data, _ = await throttled_get("binance", url, timeout=10)
-        if not data: return None
-        big_buys = []; big_sells = []
-        for t in data:
-            price = float(t["p"]); qty = float(t["q"]); notional = price * qty
-            if notional >= WHALE_NOTIONAL_USD:
-                (big_sells if t.get("m") else big_buys).append(notional)
-        buy_usd  = sum(big_buys); sell_usd = sum(big_sells)
-        large_tx = len(big_buys) + len(big_sells)
-        net_bias = "bullish" if buy_usd > sell_usd * 1.3 else ("bearish" if sell_usd > buy_usd * 1.3 else "neutral")
-        return {
-            "large_tx":    large_tx,
-            "buy_usd":     round(buy_usd, 0),
-            "sell_usd":    round(sell_usd, 0),
-            "bullish":     net_bias == "bullish",
-            "bearish":     net_bias == "bearish",
-            "alert":       large_tx >= 5 and net_bias != "neutral",
-            "source":      "exchange_trades",  # نه آنچین واقعی
-        }
-    except Exception as e:
-        log.warning(f"WhaleAlert {symbol}: {e}")
-        return None
+    for name, fn in [("Binance", _whale_trades_binance), ("MEXC", _whale_trades_mexc), ("Bybit", _whale_trades_bybit)]:
+        try:
+            result = await fn(symbol)
+            if result is None: continue
+            big_buys, big_sells = result
+            buy_usd = sum(big_buys); sell_usd = sum(big_sells)
+            large_tx = len(big_buys) + len(big_sells)
+            net_bias = "bullish" if buy_usd > sell_usd * 1.3 else ("bearish" if sell_usd > buy_usd * 1.3 else "neutral")
+            if name != "Binance": log.info(f"whale {symbol} از {name}")
+            return {
+                "large_tx": large_tx, "buy_usd": round(buy_usd, 0), "sell_usd": round(sell_usd, 0),
+                "bullish": net_bias == "bullish", "bearish": net_bias == "bearish",
+                "alert": large_tx >= 5 and net_bias != "neutral",
+                "source": name,
+            }
+        except Exception as e:
+            log.warning(f"WhaleAlert [{name}] {symbol}: {e}")
+    return None
 
 async def get_whale_alerts(symbol):
     return await cached_call(f"whale:{symbol}", lambda: _get_whale_alerts_uncached(symbol))
@@ -1994,33 +2033,77 @@ def _fallback_explanation(analysis, futures_data=None, news=None):
 # =========================
 # NEW/HOT COIN SCANNER (اسکن ارزهای جدید و پرنوسان)
 # =========================
+async def _scan_binance(top_n):
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    data, _ = await throttled_get("binance", url, timeout=15)
+    if not data: return None
+    out = []
+    for d in data:
+        sym = d.get("symbol", "")
+        if not sym.endswith("USDT"): continue
+        try:
+            change = abs(float(d.get("priceChangePercent", 0)))
+            qvol   = float(d.get("quoteVolume", 0))
+        except Exception:
+            continue
+        if qvol < 3_000_000 or change < 8: continue
+        out.append({"symbol": sym, "change_pct": round(change, 2), "quote_volume": round(qvol, 0)})
+    return out
+
+async def _scan_mexc(top_n):
+    """فال‌بک: تیکر ۲۴ ساعته اسپات MEXC"""
+    url = "https://api.mexc.com/api/v3/ticker/24hr"
+    data, _ = await throttled_get("mexc", url, timeout=15)
+    if not data or not isinstance(data, list): return None
+    out = []
+    for d in data:
+        sym = d.get("symbol", "")
+        if not sym.endswith("USDT"): continue
+        try:
+            change = abs(float(d.get("priceChangePercent", 0)))
+            qvol   = float(d.get("quoteVolume", 0))
+        except Exception:
+            continue
+        if qvol < 3_000_000 or change < 8: continue
+        out.append({"symbol": sym, "change_pct": round(change, 2), "quote_volume": round(qvol, 0)})
+    return out
+
+async def _scan_bybit(top_n):
+    """فال‌بک دوم: تیکر فیوچرز خطی Bybit (price24hPcnt کسری‌ست، ×۱۰۰ می‌شه)"""
+    url = "https://api.bybit.com/v5/market/tickers?category=linear"
+    data, _ = await throttled_get("bybit", url, timeout=15)
+    if not data or not isinstance(data, dict): return None
+    rows = (data.get("result") or {}).get("list") or []
+    out = []
+    for d in rows:
+        sym = d.get("symbol", "")
+        if not sym.endswith("USDT"): continue
+        try:
+            change = abs(float(d.get("price24hPcnt", 0))) * 100
+            qvol    = float(d.get("turnover24h", 0))
+        except Exception:
+            continue
+        if qvol < 3_000_000 or change < 8: continue
+        out.append({"symbol": sym, "change_pct": round(change, 2), "quote_volume": round(qvol, 0)})
+    return out
+
 async def scan_hot_coins(top_n=8):
     """
-    اسکن آلت‌کوین‌های پرنوسان بر اساس تغییر قیمت ۲۴h و جهش حجم غیرعادی روی فیوچرز Binance.
+    اسکن آلت‌کوین‌های پرنوسان با فال‌بک بین چند صرافی (Binance → MEXC → Bybit)
+    تا اگر یکی در دسترس نبود (مثلاً محدودیت جغرافیایی)، بقیه امتحان بشن.
     ⚠️ این روش نشانگر «نوسان بالا» ست، نه تشخیص قطعی لیست جدید صرافی
     (تاریخ لیست‌شدن دقیق نیاز به endpoint اختصاصی هر صرافیه که رایگان در دسترس نیست).
     """
-    try:
-        url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-        data, _ = await throttled_get("binance", url, timeout=15)
-        if not data: return []
-        candidates = []
-        for d in data:
-            sym = d.get("symbol", "")
-            if not sym.endswith("USDT"): continue
-            try:
-                change = abs(float(d.get("priceChangePercent", 0)))
-                qvol   = float(d.get("quoteVolume", 0))
-            except Exception:
-                continue
-            if qvol < 3_000_000: continue  # حذف ارزهای بی‌نقدینگی
-            if change >= 8:
-                candidates.append({"symbol": sym, "change_pct": round(change, 2), "quote_volume": round(qvol, 0)})
-        candidates.sort(key=lambda x: x["change_pct"], reverse=True)
-        return candidates[:top_n]
-    except Exception as e:
-        log.warning(f"scan_hot_coins: {e}")
-        return []
+    for name, fn in [("Binance", _scan_binance), ("MEXC", _scan_mexc), ("Bybit", _scan_bybit)]:
+        try:
+            out = await fn(top_n)
+            if out is None: continue
+            out.sort(key=lambda x: x["change_pct"], reverse=True)
+            if name != "Binance": log.info(f"scan_hot_coins از {name}")
+            return out[:top_n]
+        except Exception as e:
+            log.warning(f"scan_hot_coins [{name}]: {e}")
+    return []
 
 # =========================
 # DATA
