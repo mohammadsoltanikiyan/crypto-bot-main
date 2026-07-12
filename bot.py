@@ -62,8 +62,9 @@ async def cached_call(key, coro_factory, ttl=CACHE_TTL_SECONDS):
         if hit and now - hit[0] < ttl:
             return hit[1]
     value = await coro_factory()
-    async with _cache_lock:
-        _cache_store[key] = (now, value)
+    if value is not None:   # نتیجه ناموفق (None) کش نمی‌شه تا شکست موقت رو برای کل TTL تکرار نکنه
+        async with _cache_lock:
+            _cache_store[key] = (now, value)
     return value
 
 def clear_expired_cache():
@@ -1555,7 +1556,10 @@ async def full_analysis(symbol, mode_key="short"):
     tasks = [analyze_timeframe(symbol, tf, mode["kline_limit"], mode_key) for tf in mode["timeframes"]]
     futures_tasks = [get_funding_rate(symbol), get_open_interest(symbol),
                       get_long_short_ratio(symbol), get_orderbook_imbalance(symbol), get_cvd(symbol)]
-    raw_results, fr_d, oi_d, lsr_d, obi_d, cvd_d = await asyncio.gather(*tasks, *futures_tasks)
+    n_tf = len(tasks)
+    gathered = await asyncio.gather(*tasks, *futures_tasks)
+    raw_results = gathered[:n_tf]
+    fr_d, oi_d, lsr_d, obi_d, cvd_d = gathered[n_tf:]
 
     tf_results = {}; total_score = 0; all_reasons = []; all_categories = set()
 
@@ -2794,7 +2798,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for sym in symbols[:6]:
             keyboard.append([InlineKeyboardButton(f"🐋 {sym.replace('USDT','')}", callback_data=f"whale_{sym}")])
         keyboard.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
-        await query.edit_message_text("🐋 بررسی تراکنش‌های بزرگ (آنچین):", reply_markup=InlineKeyboardMarkup(keyboard)); return
+        await query.edit_message_text("🐋 بررسی معاملات بزرگ (نهنگ‌های صرافی):", reply_markup=InlineKeyboardMarkup(keyboard)); return
 
     if data.startswith("whale_"):
         sym = data[6:]
