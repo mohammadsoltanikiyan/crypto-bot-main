@@ -1764,6 +1764,7 @@ async def run_backtest(symbol, mode_key="short", periods=20):
 
         if abs(score) < threshold: continue
         direction = "LONG" if score >= threshold else "SHORT"
+        categories = sorted(set(_categorize_reason(r) for r, sc in votes if abs(sc) >= 2))
 
         # بررسی ۵ کندل بعد
         future_closes = closes[i:i+5]
@@ -1790,7 +1791,12 @@ async def run_backtest(symbol, mode_key="short", periods=20):
             pnl = (last_price-price)/price*100 if direction=="LONG" else (price-last_price)/price*100
             outcome = "partial_win" if pnl > 0 else "partial_loss"
 
-        results.append({"direction": direction, "score": score, "outcome": outcome, "price": round(price,4)})
+        # امتیازدهی پویا: نتیجه این سیگنال تاریخی هم به یادگیری اضافه می‌شه
+        if categories:
+            update_indicator_performance(symbol, categories, outcome in ("win", "partial_win"))
+
+        results.append({"direction": direction, "score": score, "outcome": outcome,
+                         "price": round(price,4), "categories": categories})
 
     if not results: return None
     wins    = sum(1 for r in results if r["outcome"]=="win")
@@ -1802,6 +1808,85 @@ async def run_backtest(symbol, mode_key="short", periods=20):
     return {"symbol": symbol, "mode": mode_key, "total": total,
             "wins": wins, "losses": losses, "partial": partial,
             "win_rate": wr, "results": results[-10:]}
+
+# =========================
+# AUTO-BACKTEST — انتخاب خودکار بهترین روش تحلیل برای هر ارز
+# =========================
+BEST_MODE_FILE = os.environ.get("BEST_MODE_FILE", "best_mode.json")
+best_mode_data = {}   # {symbol: {"best_mode":..., "win_rate":..., "total":..., "updated":...}}
+
+def load_best_mode():
+    global best_mode_data
+    if os.path.exists(BEST_MODE_FILE):
+        try:
+            with open(BEST_MODE_FILE, "r", encoding="utf-8") as f: best_mode_data = json.load(f)
+        except Exception as e:
+            log.error(f"load_best_mode: {e}"); best_mode_data = {}
+
+def save_best_mode():
+    try:
+        tmp = BEST_MODE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f: json.dump(best_mode_data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, BEST_MODE_FILE)
+    except Exception as e:
+        log.error(f"save_best_mode: {e}")
+
+async def run_backtest_matrix(symbol, periods=15):
+    """بک‌تست همون ارز روی هر ۴ حالت معاملاتی (اسکالپ/کوتاه‌مدت/میان‌مدت/بلندمدت)"""
+    out = {}
+    for mk in TRADING_MODES:
+        try:
+            r = await run_backtest(symbol, mk, periods=periods)
+            if r: out[mk] = r
+        except Exception as e:
+            log.warning(f"run_backtest_matrix {symbol}/{mk}: {e}")
+        await asyncio.sleep(0.3)
+    return out
+
+def pick_best_mode(matrix, min_samples=6):
+    """بهترین حالت رو بر اساس نرخ موفقیت انتخاب می‌کنه (ترجیحاً با حداقل نمونه کافی)"""
+    candidates = [(mk, r) for mk, r in matrix.items() if r["total"] >= min_samples]
+    if not candidates:
+        candidates = list(matrix.items())
+    if not candidates: return None
+    best_mk, best_r = max(candidates, key=lambda x: x[1]["win_rate"])
+    return best_mk, best_r["win_rate"], best_r["total"]
+
+def get_best_mode(symbol, default="short"):
+    """حالتی که بک‌تست خودکار برای این ارز بهترین تشخیص داده؛ اگه هنوز داده‌ای نبود، پیش‌فرض کاربر"""
+    entry = best_mode_data.get(symbol)
+    if not entry: return default
+    return entry.get("best_mode", default)
+
+async def auto_backtest_all_symbols(app=None):
+    """
+    بک‌تست خودکار دوره‌ای (هر ۱۲ ساعت): برای تمام ارزهای زیرنظر کاربرها،
+    هر ۴ حالت معاملاتی رو تست می‌کنه، بهترین حالت هر ارز رو ذخیره می‌کنه،
+    و از نتایج تاریخی هر سیگنال، امتیازدهی پویا (وزن هر اندیکاتور روی هر ارز) رو آپدیت می‌کنه.
+    """
+    symbols = set()
+    for udata in user_data.values():
+        symbols.update(udata.get("symbols", []))
+    if not symbols:
+        log.info("auto_backtest_all_symbols: هیچ ارزی زیر نظر نیست"); return
+
+    log.info(f"🧪 شروع بک‌تست خودکار برای {len(symbols)} ارز...")
+    for sym in symbols:
+        try:
+            matrix = await run_backtest_matrix(sym)
+            if not matrix: continue
+            picked = pick_best_mode(matrix)
+            if not picked: continue
+            best_mk, wr, total = picked
+            best_mode_data[sym] = {"best_mode": best_mk, "win_rate": wr, "total": total,
+                                     "updated": datetime.now().isoformat(),
+                                     "all_modes": {mk: r["win_rate"] for mk, r in matrix.items()}}
+            log.info(f"  {sym}: بهترین حالت={TRADING_MODES[best_mk]['label']} (نرخ موفقیت={wr}%, نمونه={total})")
+        except Exception as e:
+            log.error(f"auto_backtest_all_symbols {sym}: {e}")
+        await asyncio.sleep(0.5)
+    save_best_mode()
+    log.info("✅ بک‌تست خودکار تمام شد.")
 
 # =========================
 # LEVERAGE ENGINE
@@ -2422,13 +2507,20 @@ def price_menu(chat_id):
     keyboard.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
     return "💰 قیمت لحظه‌ای کدوم ارز؟", InlineKeyboardMarkup(keyboard)
 
-def mode_menu():
+def mode_menu(chat_id=None):
     keyboard = []
     for k, v in TRADING_MODES.items():
         desc = {"scalp":"سریع، ریسک کم، حجم مهم","short":"متعادل، MACD+RSI","mid":"ایچیموکو+ساختار","long":"EMA200+ساختار بلندمدت"}[k]
         keyboard.append([InlineKeyboardButton(f"{v['label']}\n{desc}", callback_data=f"setmode_{k}")])
+    auto_on = user_data.get(chat_id, {}).get("auto_mode_enabled", True) if chat_id else True
+    auto_label = "🤖 حالت خودکار (بهترین روش هر ارز): روشن ✅" if auto_on else "🤖 حالت خودکار: خاموش ❌"
+    keyboard.append([InlineKeyboardButton(auto_label, callback_data="toggle_automode")])
+    keyboard.append([InlineKeyboardButton("📊 بهترین حالت هر ارز (بک‌تست خودکار)", callback_data="view_bestmodes")])
     keyboard.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
-    return "🎯 بازه معاملاتی رو انتخاب کن:", InlineKeyboardMarkup(keyboard)
+    note = ("\n\nℹ️ وقتی «حالت خودکار» روشنه، ربات بجای این انتخاب دستی، از نتیجه‌ی بک‌تست خودکار "
+            "(هر ۱۲ ساعت) استفاده می‌کنه و برای هر ارز، بهترین روش خودش رو انتخاب می‌کنه؛ "
+            "این انتخاب فقط وقتی خودکار خاموش باشه یا هنوز داده بک‌تست کافی نباشه استفاده می‌شه.")
+    return "🎯 بازه معاملاتی رو انتخاب کن:" + note, InlineKeyboardMarkup(keyboard)
 
 def add_symbol_menu(chat_id):
     current=set(user_data.get(chat_id,{}).get("symbols",[])); keyboard=[]; row=[]
@@ -2478,12 +2570,14 @@ async def check_auto_alerts(bot):
             if not udata.get("active", True): continue
             symbols   = udata.get("symbols", [])
             mode_key  = udata.get("trading_mode", "short")
+            auto_mode = udata.get("auto_mode_enabled", True)
             threshold = udata.get("auto_alert_threshold", 8)
             capital   = udata.get("capital")
 
             for symbol in symbols:
                 try:
-                    a = await full_analysis(symbol, mode_key)
+                    sym_mode = get_best_mode(symbol, default=mode_key) if auto_mode else mode_key
+                    a = await full_analysis(symbol, sym_mode)
                     if not a: continue
                     if a["direction"] == "NEUTRAL ⚪": continue
                     if abs(a["score"]) < threshold: continue
@@ -2511,14 +2605,14 @@ async def check_auto_alerts(bot):
                         udata.setdefault("active_positions", {})[symbol] = {
                             "direction": a["direction"], "entry": a["entry"],
                             "stop_loss": a["stop_loss"], "tp1": a["tp1"], "expiry": a["expiry"],
-                            "mode": mode_key, "categories_used": a.get("categories_used", []),
+                            "mode": sym_mode, "categories_used": a.get("categories_used", []),
                         }
                         stats = udata.setdefault("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
                         stats["total"] += 1
                         history = udata.setdefault("signal_history", [])
                         history.append({"symbol": symbol, "direction": a["direction"], "entry": a["entry"],
                                         "tp1": a["tp1"], "stop_loss": a["stop_loss"],
-                                        "time": datetime.now().isoformat(), "result": "در انتظار", "mode": mode_key})
+                                        "time": datetime.now().isoformat(), "result": "در انتظار", "mode": sym_mode})
                         if len(history) > 200: udata["signal_history"] = history[-200:]
                     save_data()
                     await asyncio.sleep(1)
@@ -2620,12 +2714,14 @@ async def send_analysis(bot, chat_id, symbols):
     if not user_data.get(chat_id,{}).get("active",True): return
     mode_key=user_data.get(chat_id,{}).get("trading_mode","short")
     capital=user_data.get(chat_id,{}).get("capital")
+    auto_mode=user_data.get(chat_id,{}).get("auto_mode_enabled", True)
 
     fg = await get_fear_greed()
 
     for symbol in symbols:
         try:
-            a=await full_analysis(symbol, mode_key)
+            sym_mode = get_best_mode(symbol, default=mode_key) if auto_mode else mode_key
+            a=await full_analysis(symbol, sym_mode)
             if not a:
                 await bot.send_message(chat_id=int(chat_id), text=f"❌ خطا در تحلیل {symbol}")
                 continue
@@ -2639,13 +2735,13 @@ async def send_analysis(bot, chat_id, symbols):
                 user_data[chat_id].setdefault("active_positions",{})[symbol] = {
                     "direction":a["direction"],"entry":a["entry"],
                     "stop_loss":a["stop_loss"],"tp1":a["tp1"],"expiry":a["expiry"],
-                    "mode":mode_key,"categories_used":a.get("categories_used",[]),}
+                    "mode":sym_mode,"categories_used":a.get("categories_used",[]),}
                 stats=user_data[chat_id].setdefault("signal_stats",{"total":0,"win":0,"loss":0,"neutral_exit":0})
                 stats["total"]+=1
                 history=user_data[chat_id].setdefault("signal_history",[])
                 history.append({"symbol":symbol,"direction":a["direction"],"entry":a["entry"],
                                  "tp1":a["tp1"],"stop_loss":a["stop_loss"],
-                                 "time":datetime.now().isoformat(),"result":"در انتظار","mode":mode_key})
+                                 "time":datetime.now().isoformat(),"result":"در انتظار","mode":sym_mode})
                 if len(history)>200: user_data[chat_id]["signal_history"]=history[-200:]
                 save_data()
             await bot.send_message(chat_id=int(chat_id),
@@ -2725,7 +2821,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🔍 نام ارز رو بنویس (مثلاً: BTC)\n\nبرای لغو /cancel بزن"); return
 
     if data=="menu_mode":
-        t,m=mode_menu(); await query.edit_message_text(t,reply_markup=m); return
+        t,m=mode_menu(chat_id); await query.edit_message_text(t,reply_markup=m); return
 
     if data.startswith("setmode_"):
         mk=data[8:]
@@ -2735,6 +2831,30 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_data(); schedule_user_job(context.application,chat_id)
         t,m=main_menu(chat_id)
         await query.edit_message_text(f"✅ بازه روی {TRADING_MODES[mk]['label']} تنظیم شد.\n\n"+t,reply_markup=m); return
+
+    if data=="toggle_automode":
+        cur=user_data[chat_id].get("auto_mode_enabled", True)
+        user_data[chat_id]["auto_mode_enabled"]=not cur; save_data()
+        t,m=mode_menu(chat_id); await query.edit_message_text(t,reply_markup=m); return
+
+    if data=="view_bestmodes":
+        symbols=user_data[chat_id].get("symbols",[])
+        if not best_mode_data:
+            text="⏳ بک‌تست خودکار هنوز اجرا نشده — تا ۱۲ ساعت دیگه یا بعد از اولین اجرا (چند دقیقه بعد از بالا اومدن ربات) نتیجه آماده می‌شه."
+        else:
+            text="📊 بهترین حالت هر ارز (بر اساس بک‌تست خودکار):\n\n"
+            shown=False
+            for sym in symbols:
+                info=best_mode_data.get(sym)
+                if not info:
+                    text+=f"• {sym}: هنوز داده کافی نیست\n"; continue
+                shown=True
+                mk=info["best_mode"]; wr=info["win_rate"]; total=info["total"]
+                updated=datetime.fromisoformat(info["updated"]).strftime("%Y-%m-%d %H:%M")
+                text+=f"• {sym}: {TRADING_MODES[mk]['label']} | نرخ موفقیت {wr}% ({total} نمونه) | آپدیت: {updated}\n"
+            if not shown: text+="\nهنوز برای هیچ‌کدوم از ارزهات داده کافی نیست."
+        kb=[[InlineKeyboardButton("🔙 برگشت",callback_data="menu_mode")]]
+        await context.bot.send_message(chat_id=int(chat_id), text=text, reply_markup=InlineKeyboardMarkup(kb)); return
 
     if data=="menu_capital":
         cap=user_data[chat_id].get("capital")
@@ -3003,7 +3123,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     global session
     session=aiohttp.ClientSession()
-    scheduler.start(); load_data(); load_adaptive_weights()
+    scheduler.start(); load_data(); load_adaptive_weights(); load_best_mode()
     for chat_id in user_data:
         if user_data[chat_id].get("active",True):
             try: schedule_user_job(app,chat_id)
@@ -3014,6 +3134,9 @@ async def post_init(app: Application):
     scheduler.add_job(check_auto_alerts,      "interval",minutes=30, args=[app.bot])  # هسته آلرت خودکار
     scheduler.add_job(backup_data,            "interval",minutes=10)
     scheduler.add_job(clear_expired_cache,    "interval",minutes=10)
+    # بک‌تست خودکار هر ۱۲ ساعت + یک اجرای اولیه ۲ دقیقه بعد از بالا اومدن ربات
+    scheduler.add_job(auto_backtest_all_symbols, "interval", hours=12, args=[app],
+                       next_run_time=datetime.now()+timedelta(minutes=2))
     if not GROQ_API_KEY:
         log.warning("⚠️ GROQ_API_KEY تنظیم نشده — توضیح سیگنال‌ها قانون‌محور (fallback) خواهد بود")
     log.info("✅ Bot v3.0 (Futures Edition) started — موتورهای تحلیل فیوچرز فعال")
