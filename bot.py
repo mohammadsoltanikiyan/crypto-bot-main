@@ -3,6 +3,7 @@ import json
 import aiohttp
 import asyncio
 import numpy as np
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -737,35 +738,119 @@ async def _get_liquidation_heatmap_uncached(symbol):
 async def get_liquidation_heatmap(symbol):
     return await cached_call(f"liqmap:{symbol}", lambda: _get_liquidation_heatmap_uncached(symbol))
 
+COIN_NAME_MAP = {
+    "BTC":"bitcoin","ETH":"ethereum","SOL":"solana","BNB":"binance coin","XRP":"ripple",
+    "ADA":"cardano","DOGE":"dogecoin","TRX":"tron","AVAX":"avalanche","DOT":"polkadot",
+    "MATIC":"polygon","LINK":"chainlink","LTC":"litecoin","SHIB":"shiba inu","ATOM":"cosmos",
+    "UNI":"uniswap","ETC":"ethereum classic","XLM":"stellar","NEAR":"near protocol","APT":"aptos",
+    "ARB":"arbitrum","OP":"optimism","SUI":"sui","TON":"toncoin","FIL":"filecoin",
+}
+POS_NEWS_KW = ["surge","rally","bullish","approval","partnership","upgrade","adoption",
+               "record high","breakout","integrat","launch","etf approv","gain","soar","rebound"]
+NEG_NEWS_KW = ["hack","exploit","ban","lawsuit","crash","bearish","sec charges","delist",
+               "outflow","dump","fraud","investigation","sell-off","collapse","exploited","plunge"]
+
+async def _fetch_rss_titles(url, limit=30):
+    """پارس ساده RSS با کتابخانه استاندارد (بدون نیاز به feedparser)"""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10),
+                                headers={"User-Agent": "Mozilla/5.0"}) as r:
+            if r.status != 200: return []
+            raw = await r.text()
+        root = ET.fromstring(raw)
+        titles = [el.text for el in root.iter("title") if el.text]
+        return titles[1:limit+1] if titles else []   # اولین title معمولاً عنوان کل فیده، نه خبر
+    except Exception as e:
+        log.warning(f"_fetch_rss_titles {url}: {e}")
+        return []
+
+async def _fetch_reddit_titles(coin, limit=15):
+    """جستجوی عمومی ردیت (بدون نیاز به کلید API — read-only JSON)"""
+    try:
+        url = f"https://www.reddit.com/r/CryptoCurrency/search.json?q={coin}&sort=new&limit={limit}&restrict_sr=1"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10),
+                                headers={"User-Agent": "futures-bot/1.0"}) as r:
+            if r.status != 200: return []
+            d = await r.json()
+        return [c["data"]["title"] for c in d.get("data", {}).get("children", []) if c.get("data", {}).get("title")]
+    except Exception as e:
+        log.warning(f"_fetch_reddit_titles {coin}: {e}")
+        return []
+
+def _score_titles(titles, keyword=None):
+    """امتیازدهی کلیدواژه‌ای به لیستی از تیتر — اگه keyword داده بشه فقط تیترهای مرتبط حساب می‌شن"""
+    score = 0; matched = []
+    for t in titles:
+        tl = t.lower()
+        if keyword and keyword.lower() not in tl: continue
+        s = sum(1 for k in POS_NEWS_KW if k in tl) - sum(1 for k in NEG_NEWS_KW if k in tl)
+        if keyword or s != 0:
+            matched.append(t)
+            score += s
+    return score, matched
+
 async def _get_news_sentiment_uncached(symbol):
     """
-    تحلیل فاندامنتال اخبار فوری — از CryptoCompare News (رایگان)
-    امتیازدهی ساده بر اساس کلیدواژه‌های مثبت/منفی در تیتر اخبار اخیر.
+    تحلیل فاندامنتال اخبار — تجمیع از چند منبع رایگان:
+    CryptoCompare (فیلترشده روی کوین) + CoinDesk RSS + CoinTelegraph RSS + Reddit r/CryptoCurrency
+    ⚠️ Twitter/X اضافه نشد چون سال‌هاست API رایگانش رو برداشته و فقط با کلید پولی کار می‌کنه.
     """
+    coin = symbol.replace("USDT", "")
+    coin_name = COIN_NAME_MAP.get(coin.upper(), coin.lower())
+    total_score = 0; all_headlines = []; sources_used = []
+
     try:
-        coin = symbol.replace("USDT", "")
-        url  = f"https://min-api.cryptocompare.com/data/v2/news/?categories={coin}&lang=EN"
+        url = f"https://min-api.cryptocompare.com/data/v2/news/?categories={coin}&lang=EN"
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status != 200: return None
-            d = await r.json()
-        articles = d.get("Data", [])[:15]
-        if not articles: return None
-        pos_kw = ["surge","rally","bullish","approval","partnership","upgrade","adoption",
-                  "record high","breakout","integrat","launch","etf approv","gain"]
-        neg_kw = ["hack","exploit","ban","lawsuit","crash","bearish","sec charges","delist",
-                  "outflow","dump","fraud","investigation","sell-off","collapse"]
-        score = 0; headlines = []
-        for a in articles:
-            title = (a.get("title") or "").lower()
-            s = sum(1 for k in pos_kw if k in title) - sum(1 for k in neg_kw if k in title)
-            score += s
-            if len(headlines) < 3 and s != 0:
-                headlines.append({"title": a.get("title"), "score": s, "url": a.get("url")})
-        label = "مثبت 🟢" if score > 1 else ("منفی 🔴" if score < -1 else "خنثی ⚪")
-        return {"score": score, "label": label, "sample": headlines, "count": len(articles)}
+            if r.status == 200:
+                d = await r.json()
+                articles = d.get("Data", [])[:15]
+                if articles:
+                    sources_used.append("CryptoCompare")
+                    for a in articles:
+                        title = a.get("title") or ""
+                        s, _ = _score_titles([title])
+                        total_score += s
+                        if s != 0 and len(all_headlines) < 5:
+                            all_headlines.append({"title": title, "score": s, "url": a.get("url"), "source": "CryptoCompare"})
     except Exception as e:
-        log.warning(f"NewsSentiment {symbol}: {e}")
-        return None
+        log.warning(f"NewsSentiment CryptoCompare {symbol}: {e}")
+
+    try:
+        cd_titles = await _fetch_rss_titles("https://www.coindesk.com/arc/outboundfeeds/rss/")
+        s, matched = _score_titles(cd_titles, keyword=coin_name)
+        if matched:
+            sources_used.append("CoinDesk")
+            total_score += s
+            for t in matched[:3]:
+                if len(all_headlines) < 8: all_headlines.append({"title": t, "source": "CoinDesk"})
+    except Exception as e:
+        log.warning(f"NewsSentiment CoinDesk {symbol}: {e}")
+
+    try:
+        ct_titles = await _fetch_rss_titles("https://cointelegraph.com/rss")
+        s, matched = _score_titles(ct_titles, keyword=coin_name)
+        if matched:
+            sources_used.append("CoinTelegraph")
+            total_score += s
+            for t in matched[:3]:
+                if len(all_headlines) < 8: all_headlines.append({"title": t, "source": "CoinTelegraph"})
+    except Exception as e:
+        log.warning(f"NewsSentiment CoinTelegraph {symbol}: {e}")
+
+    try:
+        reddit_titles = await _fetch_reddit_titles(coin)
+        s, matched = _score_titles(reddit_titles)
+        if matched:
+            sources_used.append("Reddit")
+            total_score += s * 0.5   # وزن کمتر چون احساسات عمومی، نه خبر رسمی
+    except Exception as e:
+        log.warning(f"NewsSentiment Reddit {symbol}: {e}")
+
+    if not sources_used: return None
+    label = "مثبت 🟢" if total_score > 1 else ("منفی 🔴" if total_score < -1 else "خنثی ⚪")
+    return {"score": round(total_score, 1), "label": label, "sample": all_headlines,
+            "sources": sources_used}
 
 async def get_news_sentiment(symbol):
     return await cached_call(f"news:{symbol}", lambda: _get_news_sentiment_uncached(symbol), ttl=600)
@@ -1120,13 +1205,42 @@ async def _whale_trades_bybit(symbol):
             (big_buys if t.get("side") == "Buy" else big_sells).append(notional)
     return big_buys, big_sells
 
+WHALE_ALERT_API_KEY = os.environ.get("WHALE_ALERT_API_KEY", "")   # اختیاری — رصد واقعی ولت آنچین
+
+async def _get_onchain_whale_alert(symbol):
+    """
+    رصد واقعی ولت‌های آنچین از Whale Alert API — فقط اگه WHALE_ALERT_API_KEY تنظیم شده باشه.
+    (پلن رایگان Whale Alert خیلی محدوده؛ برای دیتای کامل‌تر باید پلن پولی تهیه کنی.)
+    Arkham/Glassnode/CryptoQuant اضافه نشدن چون فقط با کلید API پولی/سازمانی کار می‌کنن
+    که من نمی‌تونم جایگزینش کنم — اگه کلید اون‌ها رو داری بگو تا هوکشون رو هم اضافه کنم.
+    """
+    if not WHALE_ALERT_API_KEY: return None
+    try:
+        coin = symbol.replace("USDT", "").lower()
+        url  = f"https://api.whale-alert.io/v1/transactions?api_key={WHALE_ALERT_API_KEY}&currency={coin}&min_value=500000"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200: return None
+            d = await r.json()
+        txs = d.get("transactions", [])
+        if not txs: return {"onchain_tx": 0, "onchain_usd": 0}
+        total_usd = sum(t.get("amount_usd", 0) for t in txs)
+        to_exchange = sum(1 for t in txs if (t.get("to") or {}).get("owner_type") == "exchange")
+        from_exchange = sum(1 for t in txs if (t.get("from") or {}).get("owner_type") == "exchange")
+        return {
+            "onchain_tx": len(txs), "onchain_usd": round(total_usd, 0),
+            "to_exchange": to_exchange, "from_exchange": from_exchange,   # ورود به صرافی=فشار فروش احتمالی، خروج=هودل
+        }
+    except Exception as e:
+        log.warning(f"WhaleAlert on-chain {symbol}: {e}")
+        return None
+
 async def _get_whale_alerts_uncached(symbol):
     """
-    ردیابی معاملات بزرگ (نهنگ) با فال‌بک بین چند صرافی (Binance → MEXC → Bybit)
-    تا در صورت غیرقابل‌دسترس بودن یکی (مثلاً محدودیت جغرافیایی)، بقیه امتحان بشن.
-    ⚠️ این ردیابی حرکت‌های بزرگ داخل اردربوک صرافیه، نه رصد ولت‌های آنچین
-    (رصد واقعی ولت‌ها به سرویس پولی مثل Whale Alert / Arkham نیاز داره).
+    ردیابی معاملات بزرگ — دو لایه:
+    ۱) معاملات بزرگ داخل صرافی (فال‌بک Binance→MEXC→Bybit) — همیشه فعال
+    ۲) رصد واقعی ولت آنچین از Whale Alert API — فقط اگه WHALE_ALERT_API_KEY ست شده باشه
     """
+    onchain = await _get_onchain_whale_alert(symbol)
     for name, fn in [("Binance", _whale_trades_binance), ("MEXC", _whale_trades_mexc), ("Bybit", _whale_trades_bybit)]:
         try:
             result = await fn(symbol)
@@ -1136,15 +1250,18 @@ async def _get_whale_alerts_uncached(symbol):
             large_tx = len(big_buys) + len(big_sells)
             net_bias = "bullish" if buy_usd > sell_usd * 1.3 else ("bearish" if sell_usd > buy_usd * 1.3 else "neutral")
             if name != "Binance": log.info(f"whale {symbol} از {name}")
-            return {
+            out = {
                 "large_tx": large_tx, "buy_usd": round(buy_usd, 0), "sell_usd": round(sell_usd, 0),
                 "bullish": net_bias == "bullish", "bearish": net_bias == "bearish",
                 "alert": large_tx >= 5 and net_bias != "neutral",
                 "source": name,
             }
+            if onchain: out["onchain"] = onchain
+            return out
         except Exception as e:
             log.warning(f"WhaleAlert [{name}] {symbol}: {e}")
-    return None
+    return {"large_tx": 0, "buy_usd": 0, "sell_usd": 0, "bullish": False, "bearish": False,
+            "alert": False, "source": None, "onchain": onchain} if onchain else None
 
 async def get_whale_alerts(symbol):
     return await cached_call(f"whale:{symbol}", lambda: _get_whale_alerts_uncached(symbol))
@@ -1797,7 +1914,7 @@ async def full_analysis(symbol, mode_key="short", market_type="futures"):
         expiry = (datetime.now() + timedelta(hours=mode["hold_hours"])).isoformat()
 
 
-    return {
+    result = {
         "symbol": symbol, "mode": mode_key, "mode_label": mode["label"],
         "market_type": market_type,
         "price": price, "ticker": ticker,
@@ -1812,6 +1929,10 @@ async def full_analysis(symbol, mode_key="short", market_type="futures"):
         "futures_data": {"funding": fr_d, "oi": oi_d, "lsr": lsr_d, "obi": obi_d, "cvd": cvd_d},
         "categories_used": sorted(all_categories),
     }
+    if direction != "NEUTRAL ⚪":
+        result["ml_features"] = extract_ml_features(result)
+        result["ml_win_prob"] = get_ml_win_probability(result)
+    return result
 
 # =========================
 # BACKTEST ساده
@@ -1897,6 +2018,7 @@ async def run_backtest(symbol, mode_key="short", periods=20, market_type="future
         # امتیازدهی پویا: نتیجه این سیگنال تاریخی هم به یادگیری اضافه می‌شه
         if categories:
             update_indicator_performance(symbol, categories, outcome in ("win", "partial_win"))
+        log_ml_sample(extract_ml_features_backtest(ind, score, price, sl_p), outcome in ("win", "partial_win"))
 
         results.append({"direction": direction, "score": score, "outcome": outcome,
                          "price": round(price,4), "categories": categories})
@@ -1995,6 +2117,7 @@ async def auto_backtest_all_symbols(app=None):
         await asyncio.sleep(0.5)
     save_best_mode()
     log.info("✅ بک‌تست خودکار تمام شد.")
+    train_ml_model()   # مدل ML روی کل داده‌ی جمع‌شده تا الان دوباره آموزش می‌بینه
 
 # =========================
 # LEVERAGE ENGINE
@@ -2052,6 +2175,20 @@ def calc_position_size(capital, entry, stop_loss, mode_key, agreement_pct):
             "position_pct": round(pos_pct,2), "position_size_usd": round(pos_size,2),
             "coin_amount": round(coin_amt,6), "sl_distance_pct": round(sl_pct,2)}
 
+def calc_kelly_fraction(symbol, market_type, rr, min_samples=6):
+    """
+    Kelly Criterion: f* = W - (1-W)/R
+    W = نرخ موفقیت واقعی این ارز (از بک‌تست خودکار) | R = نسبت ریوارد به ریسک (TP1/SL)
+    برای کاهش ریسک واریانس، نصف-کِلی (Half-Kelly) برمی‌گردونه و سقفش رو ۵٪ سرمایه می‌ذاره.
+    """
+    info = best_mode_data.get(_bm_key(symbol, market_type))
+    if not info or info.get("total", 0) < min_samples or rr <= 0: return None
+    w = info["win_rate"] / 100
+    kelly = w - (1 - w) / rr
+    if kelly <= 0: return {"pct": 0.0, "win_rate": info["win_rate"], "total": info["total"], "note": "منفی — طبق آمار گذشته این معامله ریاضی مثبت نیست"}
+    half_kelly = max(0.0, min(kelly / 2, 0.05))
+    return {"pct": round(half_kelly * 100, 2), "win_rate": info["win_rate"], "total": info["total"], "note": None}
+
 def build_mm_section(capital, analysis):
     if not capital or analysis["direction"] == "NEUTRAL ⚪" or not analysis["stop_loss"]: return ""
     mm   = calc_position_size(capital, analysis["entry"], analysis["stop_loss"], analysis["mode"], analysis["agreement"])
@@ -2067,6 +2204,14 @@ def build_mm_section(capital, analysis):
     if rr >= 2:     msg += f"  ✅ R/R مناسب\n"
     elif rr >= 1.5: msg += f"  🟡 R/R قابل قبول\n"
     else:           msg += f"  ⚠️ R/R پایین — احتیاط\n"
+
+    kelly = calc_kelly_fraction(analysis["symbol"], analysis.get("market_type", "futures"), rr)
+    if kelly:
+        if kelly["note"]:
+            msg += f"🧮 Kelly Criterion: {kelly['note']} (نرخ موفقیت تاریخی {kelly['win_rate']}%, {kelly['total']} نمونه)\n"
+        else:
+            msg += (f"🧮 Kelly Criterion (نصف، برای احتیاط): پیشنهاد {kelly['pct']}٪ سرمایه "
+                    f"(بر پایه نرخ موفقیت واقعی {kelly['win_rate']}% این ارز روی {kelly['total']} نمونه بک‌تست)\n")
     return msg
 
 # =========================
@@ -2133,51 +2278,179 @@ def update_indicator_performance(symbol, categories_used, outcome_is_win):
     save_adaptive_weights()
 
 # =========================
-# AI SIGNAL EXPLANATION (هوش مصنوعی صادرکننده سیگنال)
+# MACHINE LEARNING (یادگیری ماشین واقعی)
+# مدل روی نتایج واقعیِ سیگنال‌های گذشته (بک‌تست + پوزیشن‌های زنده) آموزش می‌بینه
+# و احتمال موفقیت رو پیش‌بینی می‌کنه — صرفاً advisory، جهت/SL/TP رو عوض نمی‌کنه.
+# ⚠️ LSTM/Transformer عمداً اضافه نشد: به دیتاست بزرگ برچسب‌خورده و GPU نیاز دارن که
+# برای یک ربات تلگرام با این حجم داده واقع‌بینانه نیست و صرفاً تزئینی می‌شد.
 # =========================
+try:
+    from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+    import joblib
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
+ML_MODEL_FILE  = os.environ.get("ML_MODEL_FILE", "ml_model.joblib")
+ML_DATA_FILE   = os.environ.get("ML_DATA_FILE", "ml_training_data.jsonl")
+ML_ALGO        = os.environ.get("ML_ALGO", "gbm")   # "gbm" یا "rf"
+ML_MIN_SAMPLES = 40
+ml_model = None
+
+def extract_ml_features(analysis):
+    """بردار ویژگی عددی از خروجی full_analysis برای مدل ML"""
+    fd = analysis.get("futures_data", {}) or {}
+    fr, oi, lsr, obi, cvd = fd.get("funding"), fd.get("oi"), fd.get("lsr"), fd.get("obi"), fd.get("cvd")
+    tfs = list(analysis.get("timeframes", {}).values())
+    main = tfs[len(tfs)//2]["indicators"] if tfs else {}
+    rsi_v = main.get("rsi", 50) if isinstance(main.get("rsi"), (int, float)) else 50
+    adx_v = main.get("adx", {}).get("adx", 20) if isinstance(main.get("adx"), dict) else 20
+    atr_pct = abs(analysis["entry"]-analysis["stop_loss"])/analysis["entry"]*100 if analysis.get("stop_loss") else 1.0
+    cvd_signed = (cvd.get("strength", 0) * (1 if cvd.get("bias") == "bullish" else -1)) if cvd else 0
+    return [
+        float(analysis.get("score", 0)), float(analysis.get("agreement", 0)),
+        float(rsi_v), float(adx_v),
+        float(fr["rate"]) if fr else 0.0,
+        float(oi["change_pct"]) if oi and oi.get("change_pct") is not None else 0.0,
+        float(lsr["ratio"]) if lsr else 1.0,
+        float(obi["imbalance_pct"]) if obi else 0.0,
+        float(cvd_signed), float(atr_pct),
+    ]
+
+ML_FEATURE_NAMES = ["score","agreement","rsi","adx","funding_rate","oi_change","lsr_ratio","obi_pct","cvd_signed","atr_pct"]
+
+def extract_ml_features_backtest(ind, score, price, sl_price):
+    """نسخه سبک feature extractor برای نمونه‌های بک‌تست (دیتای فیوچرز لحظه‌ای در تاریخچه در دسترس نیست)"""
+    rsi_v = ind.get("rsi", 50) if isinstance(ind.get("rsi"), (int, float)) else 50
+    adx_v = ind.get("adx", {}).get("adx", 20) if isinstance(ind.get("adx"), dict) else 20
+    atr_pct = abs(price - sl_price) / price * 100 if price else 1.0
+    return [float(score), 0.0, float(rsi_v), float(adx_v), 0.0, 0.0, 1.0, 0.0, 0.0, float(atr_pct)]
+
+def log_ml_sample(features, label):
+    """هر سیگنال (بک‌تست یا زنده) با نتیجه نهایی‌ش به دیتاست آموزش اضافه می‌شه"""
+    try:
+        with open(ML_DATA_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"x": features, "y": int(label)}) + "\n")
+    except Exception as e:
+        log.error(f"log_ml_sample: {e}")
+
+def train_ml_model():
+    """آموزش دوره‌ای مدل روی کل دیتاست جمع‌شده — در همون job بک‌تست خودکار صدا زده می‌شه"""
+    global ml_model
+    if not SKLEARN_AVAILABLE:
+        log.warning("⚠️ scikit-learn نصب نیست — لایه ML غیرفعاله (pip install scikit-learn joblib)")
+        return False
+    if not os.path.exists(ML_DATA_FILE): return False
+    X, y = [], []
+    try:
+        with open(ML_DATA_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                    X.append(row["x"]); y.append(row["y"])
+                except Exception:
+                    continue
+    except Exception as e:
+        log.error(f"train_ml_model read: {e}"); return False
+    if len(X) < ML_MIN_SAMPLES or len(set(y)) < 2:
+        log.info(f"🧠 ML: فقط {len(X)} نمونه — حداقل {ML_MIN_SAMPLES} نمونه با هر دو نتیجه (برد/باخت) لازمه")
+        return False
+    try:
+        model = (GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
+                 if ML_ALGO == "gbm" else RandomForestClassifier(n_estimators=200, max_depth=5, random_state=42))
+        model.fit(X, y)
+        joblib.dump(model, ML_MODEL_FILE)
+        ml_model = model
+        log.info(f"✅ مدل ML ({ML_ALGO}) روی {len(X)} نمونه آموزش دید و ذخیره شد")
+        return True
+    except Exception as e:
+        log.error(f"train_ml_model fit: {e}"); return False
+
+def load_ml_model():
+    global ml_model
+    if not SKLEARN_AVAILABLE: return
+    if os.path.exists(ML_MODEL_FILE):
+        try:
+            ml_model = joblib.load(ML_MODEL_FILE)
+            log.info("✅ مدل ML قبلی از دیسک بارگذاری شد")
+        except Exception as e:
+            log.warning(f"load_ml_model: {e}")
+
+def get_ml_win_probability(analysis):
+    """
+    احتمال موفقیت این سیگنال طبق مدل ML آموزش‌دیده — فقط نمایشی/advisory.
+    اگه مدل هنوز آماده نباشه (داده کافی نیست)، None برمی‌گرده و هیچ‌چیزی نشون داده نمی‌شه.
+    """
+    if not SKLEARN_AVAILABLE or ml_model is None: return None
+    try:
+        x = [extract_ml_features(analysis)]
+        proba = ml_model.predict_proba(x)[0]
+        classes = list(ml_model.classes_)
+        win_idx = classes.index(1) if 1 in classes else -1
+        return round(float(proba[win_idx]) * 100, 1) if win_idx >= 0 else None
+    except Exception as e:
+        log.warning(f"get_ml_win_probability: {e}")
+        return None
+
+
+def _aggregate_category_votes(analysis):
+    """جمع امتیاز هر دسته اندیکاتور (RSI/MACD/CVD/...) در کل تایم‌فریم‌ها — برای reasoning واقعی AI"""
+    agg = {}
+    for tf, res in (analysis.get("timeframes") or {}).items():
+        for reason, score, cat in res.get("weighted_votes", []):
+            agg[cat] = agg.get(cat, 0) + score
+    return {k: round(v, 2) for k, v in sorted(agg.items(), key=lambda x: -abs(x[1]))}
+
 async def get_ai_review(analysis, futures_data=None, news=None):
     """
     یک تماس با Groq که هم توضیح سیگنال رو می‌ده، هم به‌عنوان یک لایه دومِ advisory
-    چک می‌کنه که آیا بین اجزای مختلف دیتا (تکنیکال/فاندینگ/اخبار/OI) تناقض معنی‌داری هست.
+    خروجی خام هر دسته اندیکاتور (نه فقط امتیاز نهایی) رو تحلیل می‌کنه تا واقعاً
+    استدلال کنه کدوم اندیکاتورها هم‌جهتن و کدوم مخالف جهت سیگنال نهایی رأی دادن،
+    و آیا بین تکنیکال/فاندینگ/اخبار/OI تناقض معنی‌داری هست.
 
     ⚠️ طراحی عمدی: خروجی این تابع هرگز جهت/SL/TP/امتیاز رو تغییر نمی‌ده و نمی‌تونه سیگنال
-    رو حذف کنه — فقط یک پرچم هشدار متنی («caution») اضافه به پیام می‌کنه. تصمیم نهایی
-    همیشه دست موتور امتیازدهی قانون‌محور می‌مونه، نه AI.
+    رو حذف کنه — فقط یک پرچم هشدار متنی («caution») و یک تحلیل استدلالی اضافه به پیام می‌کنه.
+    تصمیم نهایی همیشه دست موتور امتیازدهی قانون‌محور می‌مونه، نه AI.
 
-    خروجی: {"explanation": str, "verdict": "confirm"|"caution", "concern": str|None}
+    خروجی: {"explanation": str, "indicator_reasoning": str, "verdict": "confirm"|"caution", "concern": str|None}
     """
     if not analysis or analysis["direction"] == "NEUTRAL ⚪": return None
     default = {"explanation": _fallback_explanation(analysis, futures_data, news),
-               "verdict": "confirm", "concern": None}
+               "indicator_reasoning": None, "verdict": "confirm", "concern": None}
     if not GROQ_API_KEY:
         return default
     try:
+        category_votes = _aggregate_category_votes(analysis)
         summary = {
             "symbol": analysis["symbol"], "direction": analysis["direction"],
             "score": analysis["score"], "agreement": analysis["agreement"],
             "confidence": analysis["confidence"], "reasons": analysis["reasons"],
             "mode": analysis["mode_label"],
+            "category_votes": category_votes,   # امتیاز هر دسته اندیکاتور — مثبت=صعودی، منفی=نزولی
             "funding_rate": futures_data.get("funding") if futures_data else None,
             "open_interest_change": futures_data.get("oi") if futures_data else None,
             "long_short_ratio": futures_data.get("lsr") if futures_data else None,
             "cvd": futures_data.get("cvd") if futures_data else None,
             "orderbook_imbalance": futures_data.get("obi") if futures_data else None,
             "news_sentiment": news.get("label") if news else None,
+            "ml_win_probability": analysis.get("ml_win_prob"),
         }
         prompt = (
             "تو یک تحلیلگر ارشد فیوچرز کریپتو هستی و داری یه سیگنال از قبل صادرشده رو مرور می‌کنی "
             "(جهت و اعداد ورود/خروج قبلاً با موتور قانون‌محور مشخص شده و قابل تغییر نیست؛ فقط نظر مرورگر می‌خوایم).\n\n"
-            f"دیتا:\n{json.dumps(summary, ensure_ascii=False)}\n\n"
+            f"دیتا (category_votes یعنی امتیاز هر دسته اندیکاتور در جمع همه تایم‌فریم‌ها؛ مثبت=صعودی، منفی=نزولی):\n"
+            f"{json.dumps(summary, ensure_ascii=False)}\n\n"
             "فقط یک JSON خالص (بدون ```json و بدون هیچ متن اضافه) با این فرمت برگردون:\n"
             '{"explanation": "۳ تا ۵ جمله فارسی روان درباره چرایی سیگنال و ریسکش", '
+            '"indicator_reasoning": "۲ تا ۳ جمله: کدوم دسته‌های اندیکاتور با جهت سیگنال هم‌جهتن، کدوم‌ها مخالفن، و اگه اختلاف معنی‌داری بین دسته‌ها هست بگو", '
             '"verdict": "confirm" یا "caution", '
             '"concern": "اگه caution، یک جمله کوتاه بگو چه تناقضی بین اجزای دیتا دیدی؛ وگرنه null"}\n'
             'verdict فقط وقتی caution باشه که واقعاً بین دیتای تکنیکال و فاندینگ/اخبار/OI/CVD تناقض معنی‌دار وجود داشته باشه '
-            '(مثلاً سیگنال LONG ولی اکثریت شدید بازار هم لانگ‌ان و Funding به‌شدت مثبته، یا اخبار به‌وضوح منفیه).'
+            '(مثلاً سیگنال LONG ولی اکثریت شدید بازار هم لانگ‌ان و Funding به‌شدت مثبته، یا اخبار به‌وضوح منفیه، یا اکثر دسته‌های اندیکاتور مخالف جهت سیگنال نهایی رأی دادن).'
         )
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        body = {"model": GROQ_MODEL, "max_tokens": 400, "temperature": 0.3,
+        body = {"model": GROQ_MODEL, "max_tokens": 500, "temperature": 0.3,
                 "response_format": {"type": "json_object"},
                 "messages": [{"role": "user", "content": prompt}]}
         async with session.post(url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=20)) as r:
@@ -2192,6 +2465,7 @@ async def get_ai_review(analysis, futures_data=None, news=None):
             verdict = parsed.get("verdict") if parsed.get("verdict") in ("confirm", "caution") else "confirm"
             return {
                 "explanation": parsed.get("explanation") or default["explanation"],
+                "indicator_reasoning": parsed.get("indicator_reasoning"),
                 "verdict": verdict,
                 "concern": parsed.get("concern") if verdict == "caution" else None,
             }
@@ -2411,14 +2685,21 @@ def build_analysis_message(a, capital=None, fg=None, fr=None, whale=None,
     if is_futures and liq_map:
         msg += f"🗺 لیکوئیدیشن تخمینی: پایین {format_price(liq_map['long_liq_zone'])} | بالا {format_price(liq_map['short_liq_zone'])}\n"
     if news and news.get("label") and "خنثی" not in news["label"]:
-        msg += f"📰 اخبار: {news['label']}\n"
+        srcs = "/".join(news.get("sources", [])) or "?"
+        msg += f"📰 اخبار ({srcs}): {news['label']}\n"
     if whale and whale.get("alert"):
         w_emoji = "🟢" if whale.get("bullish") else ("🔴" if whale.get("bearish") else "🐋")
         msg += f"{w_emoji} فشار نهنگ‌ها: {whale.get('large_tx',0)} معامله بزرگ (خرید ${whale.get('buy_usd',0):,.0f} / فروش ${whale.get('sell_usd',0):,.0f})\n"
+    if whale and whale.get("onchain") and whale["onchain"].get("onchain_tx"):
+        oc = whale["onchain"]
+        msg += (f"⛓ آنچین واقعی: {oc['onchain_tx']} تراکنش (${oc['onchain_usd']:,.0f}) — "
+                f"ورود به صرافی: {oc.get('to_exchange',0)} | خروج: {oc.get('from_exchange',0)}\n")
 
     msg += f"\n🎯 سیگنال: {a['direction']}\n"
     msg += f"💪 اطمینان: {a['confidence']}\n"
     msg += f"📐 امتیاز: {a['score']}  |  هم‌راستایی: {a['agreement']}%\n"
+    if a.get("ml_win_prob") is not None:
+        msg += f"🧠 احتمال موفقیت (ML): {a['ml_win_prob']}٪  (تجربی — مکمل امتیاز اصلیه، نه جایگزینش)\n"
     msg += f"📊 تأیید TF: ✅{agg['bullish']} صعودی | ❌{agg['bearish']} نزولی | ⚪{agg['neutral']} خنثی\n"
 
     if a.get("is_ranging"):
@@ -2500,6 +2781,8 @@ def build_analysis_message(a, capital=None, fg=None, fr=None, whale=None,
         if ai_review.get("verdict") == "caution" and ai_review.get("concern"):
             msg += f"\n⚠️ فیلتر AI — نکته احتیاطی:\n{ai_review['concern']}\n"
         msg += f"\n🤖 توضیح هوش مصنوعی:\n{ai_review.get('explanation','')}\n"
+        if ai_review.get("indicator_reasoning"):
+            msg += f"\n🧩 استدلال روی اندیکاتورها:\n{ai_review['indicator_reasoning']}\n"
 
     msg += f"\n🔗 {tv}\n━━━━━━━━━━━━━━━━━━━━"
     return msg
@@ -2725,11 +3008,14 @@ async def check_auto_alerts(bot):
 
                     last_alerts[symbol] = {"direction": a["direction"], "time": datetime.now().isoformat()}
                     if a["expiry"]:
+                        sl_dist = abs(a["entry"]-a["stop_loss"])/a["entry"]*100 if a["stop_loss"] else 1.0
                         udata.setdefault("active_positions", {})[symbol] = {
                             "direction": a["direction"], "entry": a["entry"],
                             "stop_loss": a["stop_loss"], "tp1": a["tp1"], "expiry": a["expiry"],
                             "mode": sym_mode, "categories_used": a.get("categories_used", []),
-                            "market_type": market_type,
+                            "market_type": market_type, "ml_features": a.get("ml_features"),
+                            "current_sl": a["stop_loss"], "sl_distance_pct": round(sl_dist, 4),
+                            "breakeven_moved": False, "trailing_active": False,
                         }
                         stats = udata.setdefault("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
                         stats["total"] += 1
@@ -2775,6 +3061,50 @@ async def check_price_alerts(bot):
 # =========================
 # POSITION TRACKER
 # =========================
+async def manage_active_positions(bot):
+    """
+    مدیریت هوشمند پوزیشن‌های باز (Break-even خودکار + Trailing Stop) — هر ۳ دقیقه.
+    ⚠️ این ربات مستقیم به حساب صرافی وصل نیست و سفارش واقعی جابه‌جا نمی‌کنه؛
+    این پیام‌ها فقط پیشنهاد/هشدارن که خودت SL واقعی رو تو صرافی دستی جابه‌جا کنی.
+    """
+    now = datetime.now()
+    for chat_id, udata in list(user_data.items()):
+        positions = udata.get("active_positions", {})
+        for sym, pos in list(positions.items()):
+            try:
+                if pos.get("expiry") and now >= datetime.fromisoformat(pos["expiry"]): continue  # کار این با check_expired_positions
+                if "current_sl" not in pos: continue  # پوزیشن‌های قدیمی قبل از این آپدیت
+                mt = pos.get("market_type", "futures")
+                ticker = await (get_futures_ticker(sym) if mt == "futures" else get_ticker(sym))
+                if not ticker: continue
+                current = ticker["price"]; entry = pos["entry"]; direction = pos["direction"]
+                tp1 = pos.get("tp1"); sl_pct = pos.get("sl_distance_pct", 1.0)
+                is_long = "LONG" in direction
+                progress_pct = ((current-entry)/entry*100) if is_long else ((entry-current)/entry*100)
+
+                if not pos.get("breakeven_moved") and progress_pct >= sl_pct:
+                    pos["current_sl"] = entry
+                    pos["breakeven_moved"] = True
+                    await bot.send_message(chat_id=int(chat_id),
+                        text=(f"🔒 {sym}: سود به اندازه ریسک اولیه رسید.\n"
+                              f"پیشنهاد: استاپ لاست رو به نقطه ورود ({format_price(entry)}) منتقل کن (Break-even) تا ریسکت صفر بشه."))
+
+                hit_tp1 = tp1 and ((current >= tp1) if is_long else (current <= tp1))
+                if hit_tp1 and not pos.get("trailing_active"):
+                    pos["current_sl"] = tp1
+                    pos["trailing_active"] = True
+                    await bot.send_message(chat_id=int(chat_id),
+                        text=(f"📈 {sym}: به TP1 رسید!\n"
+                              f"پیشنهاد: استاپ لاست رو به سطح TP1 ({format_price(tp1)}) منتقل کن تا سود قفل بشه (Trailing Stop).\n"
+                              f"می‌تونی بخشی از پوزیشن رو همین‌جا ببندی و بقیه رو با تریل ادامه بدی."))
+                elif pos.get("trailing_active"):
+                    trail_sl = current*(1-sl_pct/100) if is_long else current*(1+sl_pct/100)
+                    if is_long and trail_sl > pos["current_sl"]:      pos["current_sl"] = round(trail_sl, 6)
+                    elif not is_long and trail_sl < pos["current_sl"]: pos["current_sl"] = round(trail_sl, 6)
+            except Exception as e:
+                log.error(f"manage_active_positions {chat_id}/{sym}: {e}")
+    save_data()
+
 async def check_expired_positions(bot):
     """
     هسته پوزیشن — کاملاً جدا از هسته آلرت خودکار.
@@ -2801,7 +3131,7 @@ async def check_expired_positions(bot):
 
                 positions.pop(sym, None)  # فقط بعد از موفقیت حذف می‌شه
                 current = ticker["price"]; entry = pos["entry"]; direction = pos["direction"]
-                tp1 = pos.get("tp1"); sl = pos.get("stop_loss")
+                tp1 = pos.get("tp1"); sl = pos.get("current_sl", pos.get("stop_loss"))
                 if "LONG" in direction:
                     pnl_pct = (current-entry)/entry*100; hit_tp1 = tp1 and current >= tp1; hit_sl = sl and current <= sl
                 else:
@@ -2822,6 +3152,9 @@ async def check_expired_positions(bot):
                 # امتیازدهی پویا: اندیکاتورهایی که در این سیگنال شرکت داشتن آپدیت می‌شن
                 cats = pos.get("categories_used", [])
                 if cats: update_indicator_performance(sym, cats, is_win)
+
+                ml_feat = pos.get("ml_features")
+                if ml_feat: log_ml_sample(ml_feat, is_win)
 
                 await bot.send_message(chat_id=int(chat_id),
                     text=(f"⏰ پوزیشن {sym} منقضی شد!\n\n"
@@ -2858,11 +3191,14 @@ async def send_analysis(bot, chat_id, symbols):
             ai_review = await get_ai_review(a, a.get("futures_data"), news) if a["direction"]!="NEUTRAL ⚪" else None
 
             if a["direction"]!="NEUTRAL ⚪" and a["expiry"]:
+                sl_dist = abs(a["entry"]-a["stop_loss"])/a["entry"]*100 if a["stop_loss"] else 1.0
                 user_data[chat_id].setdefault("active_positions",{})[symbol] = {
                     "direction":a["direction"],"entry":a["entry"],
                     "stop_loss":a["stop_loss"],"tp1":a["tp1"],"expiry":a["expiry"],
                     "mode":sym_mode,"categories_used":a.get("categories_used",[]),
-                    "market_type":market_type,}
+                    "market_type":market_type,"ml_features":a.get("ml_features"),
+                    "current_sl":a["stop_loss"],"sl_distance_pct":round(sl_dist,4),
+                    "breakeven_moved":False,"trailing_active":False,}
                 stats=user_data[chat_id].setdefault("signal_stats",{"total":0,"win":0,"loss":0,"neutral_exit":0})
                 stats["total"]+=1
                 history=user_data[chat_id].setdefault("signal_history",[])
@@ -3055,6 +3391,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             exp=datetime.fromisoformat(pos["expiry"]).strftime("%H:%M")
             live_ticker = await (get_futures_ticker(sym) if pos.get("market_type","futures")=="futures" else get_ticker(sym))
             direction = pos["direction"]; entry = pos["entry"]
+            cur_sl = pos.get("current_sl", pos["stop_loss"])
+            sl_badge = ""
+            if pos.get("trailing_active"): sl_badge = " 🔄(Trailing)"
+            elif pos.get("breakeven_moved"): sl_badge = " 🔒(Break-even)"
             if live_ticker:
                 current = live_ticker["price"]
                 pnl_pct = (current-entry)/entry*100 if "LONG" in direction else (entry-current)/entry*100
@@ -3063,7 +3403,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 live_line = "  ⚠️ قیمت لحظه‌ای در دسترس نیست\n"
             text+=(f"• {sym} | {direction}\n"
-                   f"  ورود: {format_price(pos['entry'])} | SL: {format_price(pos['stop_loss'])}\n"
+                   f"  ورود: {format_price(pos['entry'])} | SL: {format_price(cur_sl)}{sl_badge}\n"
                    f"  TP1: {format_price(pos['tp1'])} | انقضا: {exp}\n"
                    f"{live_line}\n")
         total=stats["total"]; win=stats["win"]; loss=stats["loss"]
@@ -3157,6 +3497,13 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"🟢 حجم خرید نهنگ‌ها:   ${wa.get('buy_usd',0):,.0f}\n"
             msg += f"🔴 حجم فروش نهنگ‌ها:   ${wa.get('sell_usd',0):,.0f}\n\n"
             msg += "ℹ️ این آمار از معاملات بزرگ (≥$100k) داخل صرافیه، نه رصد ولت آنچین.\n"
+            oc = wa.get("onchain")
+            if oc and oc.get("onchain_tx"):
+                msg += (f"\n⛓ آنچین واقعی (Whale Alert): {oc['onchain_tx']} تراکنش (${oc['onchain_usd']:,.0f})\n"
+                        f"   ورود به صرافی: {oc.get('to_exchange',0)} (فشار فروش احتمالی) | "
+                        f"خروج از صرافی: {oc.get('from_exchange',0)} (هودل احتمالی)\n")
+            elif not WHALE_ALERT_API_KEY:
+                msg += "💡 برای رصد واقعی ولت آنچین، یه کلید Whale Alert بگیر و WHALE_ALERT_API_KEY رو تنظیم کن.\n"
             if wa["alert"]: msg += "⚠️ فشار قابل‌توجه نهنگ‌ها — احتمال حرکت قیمتی\n"
         await context.bot.send_message(chat_id=int(chat_id), text=msg)
         t,m=main_menu(chat_id)
@@ -3262,13 +3609,14 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     global session
     session=aiohttp.ClientSession()
-    scheduler.start(); load_data(); load_adaptive_weights(); load_best_mode()
+    scheduler.start(); load_data(); load_adaptive_weights(); load_best_mode(); load_ml_model()
     for chat_id in user_data:
         if user_data[chat_id].get("active",True):
             try: schedule_user_job(app,chat_id)
             except Exception as e: log.error(f"Schedule error {chat_id}: {e}")
     # job های سیستمی — هسته پوزیشن و هسته آلرت کاملاً جدا از هم هستن
     scheduler.add_job(check_expired_positions,"interval",minutes=5,  args=[app.bot])  # هسته پوزیشن
+    scheduler.add_job(manage_active_positions, "interval",minutes=3,  args=[app.bot])  # Break-even/Trailing
     scheduler.add_job(check_price_alerts,     "interval",minutes=2,  args=[app.bot])
     scheduler.add_job(check_auto_alerts,      "interval",minutes=30, args=[app.bot])  # هسته آلرت خودکار
     scheduler.add_job(backup_data,            "interval",minutes=10)
