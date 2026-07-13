@@ -3,3 +3,5 @@ aiohttp==3.9.5
 numpy==1.26.4
 APScheduler==3.10.4
 python-dotenv==1.0.1
+scikit-learn
+joblib
