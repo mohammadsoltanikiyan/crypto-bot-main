@@ -1904,12 +1904,16 @@ async def full_analysis(symbol, mode_key="short", market_type="futures"):
             sl  = round(max(price - atr_v*sl_m, sr_v["near_support"]*0.997), 6)
             tp1 = round(price + atr_v*tp_m[0], 6)
             tp2 = round(price + atr_v*tp_m[1], 6)
-            tp3 = round(min(sr_v["near_resistance"]*0.998, tp2*1.05), 6)
+            # TP3 باید همیشه از TP2 فراتر باشه: اگه مقاومت نزدیک از TP2 فراتر نره، از تمدید ۵٪ روی TP2 استفاده می‌شه
+            res_target = sr_v["near_resistance"]*0.998
+            tp3 = round(res_target, 6) if res_target > tp2 else round(tp2*1.05, 6)
         else:
             sl  = round(min(price + atr_v*sl_m, sr_v["near_resistance"]*1.003), 6)
             tp1 = round(price - atr_v*tp_m[0], 6)
             tp2 = round(price - atr_v*tp_m[1], 6)
-            tp3 = round(max(sr_v["near_support"]*1.002, tp2*0.95), 6)
+            # TP3 باید همیشه از TP2 پایین‌تر باشه: اگه حمایت نزدیک از TP2 پایین‌تر نره، از تمدید ۵٪ روی TP2 استفاده می‌شه
+            sup_target = sr_v["near_support"]*1.002
+            tp3 = round(sup_target, 6) if sup_target < tp2 else round(tp2*0.95, 6)
 
         expiry = (datetime.now() + timedelta(hours=mode["hold_hours"])).isoformat()
 
@@ -2822,15 +2826,16 @@ def build_performance_report(chat_id):
     win  = stats.get("win", 0); loss = stats.get("loss", 0); ne = stats.get("neutral_exit", 0)
     wr   = round(win/total*100, 1) if total > 0 else 0
 
-    # آمار بر اساس مود
+    # آمار بر اساس مود — فقط سیگنال‌های نتیجه‌گرفته‌شده حساب می‌شن (نه «در انتظار»)
     mode_stats = {}
     for h in history:
+        res = h.get("result", "")
+        if res == "در انتظار": continue   # هنوز نتیجه‌اش مشخص نیست؛ تو مخرج درصد حساب نشه
         m = h.get("mode", "short")
         if m not in mode_stats: mode_stats[m] = {"total":0,"win":0,"loss":0}
         mode_stats[m]["total"] += 1
-        res = h.get("result", "")
-        if "موفق" in res: mode_stats[m]["win"] += 1
-        elif "استاپ" in res: mode_stats[m]["loss"] += 1
+        if "موفق" in res or "سود جزئی" in res: mode_stats[m]["win"] += 1
+        elif "استاپ" in res or "ضرر جزئی" in res: mode_stats[m]["loss"] += 1
 
     msg  = f"📈 گزارش عملکرد ربات\n━━━━━━━━━━━━━━━━━━━━\n\n"
     msg += f"📊 کلی:\n"
@@ -2838,11 +2843,16 @@ def build_performance_report(chat_id):
     msg += f"  ✅ موفق:     {win} ({wr}%)\n"
     msg += f"  ❌ ناموفق:   {loss} ({round(loss/total*100,1) if total else 0}%)\n"
     msg += f"  🟡 خنثی:     {ne}\n\n"
-    msg += f"📊 بر اساس بازه:\n"
+    pending = total - win - loss - ne
+    if pending > 0:
+        msg += f"  ⏳ در انتظار نتیجه: {pending}\n\n"
+    msg += f"📊 بر اساس بازه (فقط سیگنال‌های نتیجه‌گرفته‌شده):\n"
+    if not mode_stats:
+        msg += "  هنوز هیچ سیگنالی نتیجه نگرفته\n"
     for mk, ms in mode_stats.items():
         mwr = round(ms["win"]/ms["total"]*100, 0) if ms["total"] > 0 else 0
         label = TRADING_MODES.get(mk, {}).get("label", mk)
-        msg += f"  {label}: {ms['total']} سیگنال | ✅{mwr}%\n"
+        msg += f"  {label}: {ms['total']} سیگنال نتیجه‌گرفته | ✅{mwr}%\n"
 
     # آخرین ۵ سیگنال
     if history:
@@ -3008,6 +3018,11 @@ async def check_auto_alerts(bot):
 
                     last_alerts[symbol] = {"direction": a["direction"], "time": datetime.now().isoformat()}
                     if a["expiry"]:
+                        existing_pos = udata.get("active_positions", {}).get(symbol)
+                        if existing_pos:
+                            # اگه پوزیشن قبلی این نماد هنوز باز بود، قبل از جایگزینی نتیجه‌اش رو ثبت کن
+                            # تا هیچ سیگنالی بی‌سروصدا گم/بی‌نتیجه نمونه
+                            await _resolve_position(bot, chat_id, udata, symbol, existing_pos, reason="replaced")
                         sl_dist = abs(a["entry"]-a["stop_loss"])/a["entry"]*100 if a["stop_loss"] else 1.0
                         udata.setdefault("active_positions", {})[symbol] = {
                             "direction": a["direction"], "entry": a["entry"],
@@ -3105,6 +3120,55 @@ async def manage_active_positions(bot):
                 log.error(f"manage_active_positions {chat_id}/{sym}: {e}")
     save_data()
 
+async def _resolve_position(bot, chat_id, udata, sym, pos, reason="expired"):
+    """
+    منطق مشترک بستن یه پوزیشن (چه به‌خاطر انقضا، چه چون یه سیگنال جدید برای همین نماد
+    داره جایگزینش می‌کنه) — نتیجه رو تشخیص می‌ده، آمار/تاریخچه/ML/امتیازدهی پویا رو
+    آپدیت می‌کنه، و به کاربر خبر می‌ده. با استخراج این منطق به یه تابع مشترک، پوزیشن‌ها
+    دیگه هیچ‌وقت بی‌سروصدا overwrite/گم نمی‌شن — قبل از باز شدن سیگنال جدید روی یه نماد،
+    پوزیشن قبلی‌اش (اگه باز بود) از همین تابع رد و نتیجه‌اش ثبت می‌شه.
+    """
+    try:
+        pos_market = pos.get("market_type", "futures")
+        ticker = await (get_futures_ticker(sym) if pos_market == "futures" else get_ticker(sym))
+        if not ticker:
+            return False   # نتونستیم قیمت بگیریم؛ فراخوان تصمیم می‌گیره چیکار کنه (retry یا رد شدن)
+
+        current = ticker["price"]; entry = pos["entry"]; direction = pos["direction"]
+        tp1 = pos.get("tp1"); sl = pos.get("current_sl", pos.get("stop_loss"))
+        if "LONG" in direction:
+            pnl_pct = (current-entry)/entry*100; hit_tp1 = tp1 and current >= tp1; hit_sl = sl and current <= sl
+        else:
+            pnl_pct = (entry-current)/entry*100; hit_tp1 = tp1 and current <= tp1; hit_sl = sl and current >= sl
+
+        stats = udata.setdefault("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
+        is_win = False
+        if hit_tp1:     result = "✅ موفق — به TP1 رسید!"; stats["win"] += 1; is_win = True
+        elif hit_sl:    result = "❌ استاپ لاس خورد";       stats["loss"] += 1
+        elif pnl_pct>0: result = f"🟡 سود جزئی ({pnl_pct:+.2f}%)"; stats["neutral_exit"] += 1; is_win = True
+        else:           result = f"🟠 ضرر جزئی ({pnl_pct:+.2f}%)"; stats["neutral_exit"] += 1
+
+        history = udata.setdefault("signal_history", [])
+        for h in reversed(history):   # از جدیدترین به قدیمی‌ترین، تا دقیقاً entry مربوط به همین پوزیشن آپدیت بشه
+            if h.get("symbol") == sym and h.get("result") == "در انتظار":
+                h["result"] = result; h["exit_price"] = current; h["pnl_pct"] = round(pnl_pct, 2); break
+
+        cats = pos.get("categories_used", [])
+        if cats: update_indicator_performance(sym, cats, is_win)
+
+        ml_feat = pos.get("ml_features")
+        if ml_feat: log_ml_sample(ml_feat, is_win)
+
+        note = "منقضی شد" if reason == "expired" else "با سیگنال جدید جایگزین شد"
+        await bot.send_message(chat_id=int(chat_id),
+            text=(f"⏰ پوزیشن {sym} {note}!\n\n"
+                  f"جهت: {direction}\nورود: {format_price(entry)}\n"
+                  f"قیمت الان: {format_price(current)}\nP&L: {pnl_pct:+.2f}%\n\nنتیجه: {result}"))
+        return True
+    except Exception as e:
+        log.error(f"_resolve_position {chat_id}/{sym}: {e}")
+        return False
+
 async def check_expired_positions(bot):
     """
     هسته پوزیشن — کاملاً جدا از هسته آلرت خودکار.
@@ -3119,47 +3183,14 @@ async def check_expired_positions(bot):
         for sym in expired:
             try:
                 pos = positions[sym]
-                pos_market = pos.get("market_type", "futures")
-                ticker = await (get_futures_ticker(sym) if pos_market == "futures" else get_ticker(sym))
-                if not ticker:
+                resolved = await _resolve_position(bot, chat_id, udata, sym, pos, reason="expired")
+                if resolved:
+                    positions.pop(sym, None)  # فقط بعد از موفقیت حذف می‌شه
+                else:
                     pos["retry"] = pos.get("retry", 0) + 1
                     if pos["retry"] >= 3:
-                        # بعد از ۳ بار تلاش ناموفق، بدون داده قیمت به‌عنوان نامشخص ثبت و بسته می‌شه
                         positions.pop(sym, None)
                         log.warning(f"position {sym}/{chat_id} بدون قیمت نهایی بسته شد (retry exceeded)")
-                    continue
-
-                positions.pop(sym, None)  # فقط بعد از موفقیت حذف می‌شه
-                current = ticker["price"]; entry = pos["entry"]; direction = pos["direction"]
-                tp1 = pos.get("tp1"); sl = pos.get("current_sl", pos.get("stop_loss"))
-                if "LONG" in direction:
-                    pnl_pct = (current-entry)/entry*100; hit_tp1 = tp1 and current >= tp1; hit_sl = sl and current <= sl
-                else:
-                    pnl_pct = (entry-current)/entry*100; hit_tp1 = tp1 and current <= tp1; hit_sl = sl and current >= sl
-
-                stats = udata.setdefault("signal_stats", {"total":0,"win":0,"loss":0,"neutral_exit":0})
-                is_win = False
-                if hit_tp1:     result = "✅ موفق — به TP1 رسید!"; stats["win"] += 1; is_win = True
-                elif hit_sl:    result = "❌ استاپ لاس خورد";       stats["loss"] += 1
-                elif pnl_pct>0: result = f"🟡 سود جزئی ({pnl_pct:+.2f}%)"; stats["neutral_exit"] += 1; is_win = True
-                else:           result = f"🟠 ضرر جزئی ({pnl_pct:+.2f}%)"; stats["neutral_exit"] += 1
-
-                history = udata.setdefault("signal_history", [])
-                for h in history:
-                    if h.get("symbol") == sym and h.get("result") == "در انتظار":
-                        h["result"] = result; h["exit_price"] = current; h["pnl_pct"] = round(pnl_pct, 2); break
-
-                # امتیازدهی پویا: اندیکاتورهایی که در این سیگنال شرکت داشتن آپدیت می‌شن
-                cats = pos.get("categories_used", [])
-                if cats: update_indicator_performance(sym, cats, is_win)
-
-                ml_feat = pos.get("ml_features")
-                if ml_feat: log_ml_sample(ml_feat, is_win)
-
-                await bot.send_message(chat_id=int(chat_id),
-                    text=(f"⏰ پوزیشن {sym} منقضی شد!\n\n"
-                          f"جهت: {direction}\nورود: {format_price(entry)}\n"
-                          f"قیمت الان: {format_price(current)}\nP&L: {pnl_pct:+.2f}%\n\nنتیجه: {result}"))
             except Exception as e:
                 log.error(f"expired {chat_id}/{sym}: {e}")
         save_data()
@@ -3191,6 +3222,10 @@ async def send_analysis(bot, chat_id, symbols):
             ai_review = await get_ai_review(a, a.get("futures_data"), news) if a["direction"]!="NEUTRAL ⚪" else None
 
             if a["direction"]!="NEUTRAL ⚪" and a["expiry"]:
+                existing_pos = user_data[chat_id].get("active_positions", {}).get(symbol)
+                if existing_pos:
+                    # اگه پوزیشن قبلی این نماد هنوز باز بود، قبل از جایگزینی نتیجه‌اش رو ثبت کن
+                    await _resolve_position(bot, chat_id, user_data[chat_id], symbol, existing_pos, reason="replaced")
                 sl_dist = abs(a["entry"]-a["stop_loss"])/a["entry"]*100 if a["stop_loss"] else 1.0
                 user_data[chat_id].setdefault("active_positions",{})[symbol] = {
                     "direction":a["direction"],"entry":a["entry"],
